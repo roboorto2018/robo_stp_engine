@@ -2,11 +2,13 @@
 name = "robo_stp_engine"
 version = "0.1.0"
 edition = "2021"
-description = "Motore di robo STP/IGES importer: legge STEP e IGES con OpenCascade e restituisce i triangoli"
+description = "Motore di robo importer: legge STEP e IGES con OpenCascade e restituisce i triangoli"
 license = "LGPL-2.1-only WITH OCCT-exception-1.0"
 
 [dependencies]
 anyhow = "1"
+cfb = "0.15.0"
+flate2 = "1.1.10"
 
 [build-dependencies]
 cc = "1"

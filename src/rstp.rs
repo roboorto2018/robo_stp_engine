@@ -9,6 +9,17 @@
 //!   f32 x y z  × numero_vertici        (millimetri)
 //!   u32 i j k  × numero_triangoli      (indici da 0, senso antiorario)
 //! ```
+//!
+//! Versione 2 (solo se un file 3ds Max ha oggetti ripetuti): ogni parte ha prima `u32 tipo`:
+//! 0 = geometria come nella versione 1; 1 = definizione (`u32 id` poi nome, colore e geometria locale, da NON mettere nel modello ma da
+//! riusare); 2 = istanza (`u32 id` della definizione, nome, `f32 × 12` = matrice 4x3 a vettori riga, traslazione in mm).
+//! ```text
+//! "RSTP"  u32 versione(=2)  u32 numero_voci
+//! per ogni voce:  u32 tipo
+//!   tipo 0: come una parte della versione 1
+//!   tipo 1: u32 id   poi come una parte della versione 1 (vertici in unita' locali, in mm)
+//!   tipo 2: u32 id   u32 lunghezza_nome  nome   f32 × 12
+//! ```
 
 use crate::ffi::Parte;
 use anyhow::{bail, Result};
@@ -34,6 +45,65 @@ pub fn scrivi(parti: &[Parte]) -> Vec<u8> {
         }
         for i in &p.triangoli {
             o.extend_from_slice(&i.to_le_bytes());
+        }
+    }
+    o
+}
+
+/// Una voce del file RSTP versione 2.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Voce {
+    Geometria(Parte),
+    Definizione(u32, Parte),
+    Istanza { definizione: u32, nome: String, matrice: [f32; 12] },
+}
+
+fn scrivi_parte(o: &mut Vec<u8>, p: &Parte) {
+    o.extend_from_slice(&(p.nome.len() as u32).to_le_bytes());
+    o.extend_from_slice(p.nome.as_bytes());
+    for c in p.colore.unwrap_or([-1.0; 4]) {
+        o.extend_from_slice(&c.to_le_bytes());
+    }
+    o.extend_from_slice(&((p.vertici.len() / 3) as u32).to_le_bytes());
+    o.extend_from_slice(&((p.triangoli.len() / 3) as u32).to_le_bytes());
+    for v in &p.vertici {
+        o.extend_from_slice(&v.to_le_bytes());
+    }
+    for i in &p.triangoli {
+        o.extend_from_slice(&i.to_le_bytes());
+    }
+}
+
+/// Scrive le voci: versione 1 se sono tutte geometrie semplici (compatibile con i plugin vecchi), altrimenti versione 2.
+pub fn scrivi_voci(voci: &[Voce]) -> Vec<u8> {
+    if voci.iter().all(|v| matches!(v, Voce::Geometria(_))) {
+        let parti: Vec<Parte> = voci.iter().filter_map(|v| if let Voce::Geometria(p) = v { Some(p.clone()) } else { None }).collect();
+        return scrivi(&parti);
+    }
+    let mut o = Vec::new();
+    o.extend_from_slice(MAGIC);
+    o.extend_from_slice(&2u32.to_le_bytes());
+    o.extend_from_slice(&(voci.len() as u32).to_le_bytes());
+    for v in voci {
+        match v {
+            Voce::Geometria(p) => {
+                o.extend_from_slice(&0u32.to_le_bytes());
+                scrivi_parte(&mut o, p);
+            }
+            Voce::Definizione(id, p) => {
+                o.extend_from_slice(&1u32.to_le_bytes());
+                o.extend_from_slice(&id.to_le_bytes());
+                scrivi_parte(&mut o, p);
+            }
+            Voce::Istanza { definizione, nome, matrice } => {
+                o.extend_from_slice(&2u32.to_le_bytes());
+                o.extend_from_slice(&definizione.to_le_bytes());
+                o.extend_from_slice(&(nome.len() as u32).to_le_bytes());
+                o.extend_from_slice(nome.as_bytes());
+                for m in matrice {
+                    o.extend_from_slice(&m.to_le_bytes());
+                }
+            }
         }
     }
     o
@@ -99,6 +169,20 @@ mod test {
             Parte { nome: "Senza colore".into(), colore: None, vertici: vec![], triangoli: vec![] },
         ];
         assert_eq!(leggi(&scrivi(&p)).unwrap(), p);
+    }
+
+    #[test]
+    fn versione_2_con_istanze() {
+        let def = Parte { nome: "Sedia".into(), colore: None, vertici: vec![0.0; 9], triangoli: vec![0, 1, 2] };
+        let voci = vec![
+            Voce::Definizione(7, def.clone()),
+            Voce::Istanza { definizione: 7, nome: "G/Sedia 1".into(), matrice: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 5.0, 6.0, 7.0] },
+        ];
+        let d = scrivi_voci(&voci);
+        assert_eq!(&d[4..8], &2u32.to_le_bytes());
+        // solo geometrie semplici: resta la versione 1
+        let v1 = scrivi_voci(&[Voce::Geometria(def)]);
+        assert_eq!(&v1[4..8], &1u32.to_le_bytes());
     }
 
     #[test]

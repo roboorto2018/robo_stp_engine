@@ -1,6 +1,6 @@
 # robo_stp_engine
 
-Il motore di **robo STP/IGES importer** (plugin di SketchUp): legge file **STEP** e **IGES** con
+Il motore di **robo importer** (plugin di SketchUp): legge file **STEP** e **IGES** con
 [OpenCascade](https://dev.opencascade.org/) (OCCT 7.9.3) e scrive i triangoli, con nomi, colori e posizioni
 dell'assieme, in un piccolo formato binario (`.rstp`, vedi `src/rstp.rs`).
 
@@ -33,7 +33,31 @@ Servono Rust (target `x86_64-pc-windows-msvc`), gli strumenti C++ di Visual Stud
 
 2. `cargo build --release` (se OpenCascade è altrove: variabile `OCCT_ROOT`).
 3. `cargo test --release`: prova STEP e IGES con due cubi colorati (nomi, colori, posizioni, volumi, orientamento).
-4. Copia `target/release/robo_stp_engine_silent.exe` in `robo_stp_importer/bin/` del repository dei plugin.
+4. Copia `target/release/robo_stp_engine_silent.exe` in `robo_importer/bin/` del repository dei plugin.
+
+## File 3ds Max (.max)
+
+`robo_stp_engine --input FILE.max --output FILE.rstp [--unit mm|cm|m|in|ft]` legge un file di 3ds Max **senza 3ds Max** (`src/maxfile.rs`,
+contenitore OLE con il crate `cfb`). Il formato non e' documentato da Autodesk: la lettura e' stata ricostruita analizzando file
+reali, quindi va sempre controllato il risultato.
+
+- Si leggono i nodi (nome, gruppo, posizione/rotazione/scala fisse, offset dell'oggetto) e la geometria degli oggetti **Editable Mesh** e
+  **Editable Poly** (sotto una pila di modificatori si prende l'oggetto di base: i modificatori non si applicano).
+- Non si importano spline e forme, luci, camere, materiali, texture, animazioni; le parti non hanno colore.
+- Nel blocco delle facce dell'Editable Poly la lunghezza della coda di ogni faccia non e' nota con certezza: si usa una formula e, se la faccia
+  successiva non torna, una ricerca con ritorno indietro. Una faccia che non si legge si segnala (`unreadable_faces`).
+- L'unita' del file non si legge dal file: predefinita `mm`, da indicare con `--unit`.
+- Provato su un file reale (Corona, 596 MB, 51 oggetti, 5,2 milioni di triangoli, letto in circa 1 secondo).
+
+## File SolidWorks (.sldprt)
+
+`robo_stp_engine --input FILE.sldprt --output FILE.rstp` legge un file di SolidWorks 2015 o successivo **senza SolidWorks**
+(`src/sldprt.rs`). Non si legge il solido esatto (il formato Parasolid richiede il programma di Siemens) ma la **mesh di visualizzazione**
+salvata nel file: il blocco `Contents/DisplayLists` (raw deflate, nome con i mezzi byte scambiati) contiene, per ogni faccia, posizioni e
+normali in f32 (metri) e le lunghezze dei triangle strip. Risultato: una sola parte, in millimetri.
+
+- Non si leggono colori, assiemi (`.sldasm`), solidi importati da STEP dentro SolidWorks, ne' i file anteriori al 2015 (contenitore OLE).
+- Provato su un solo file reale (`SS CHAIR.SLDPRT`, 174 facce, 66.828 triangoli, letto in 60 ms).
 
 ## Licenza
 
