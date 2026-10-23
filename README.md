@@ -16,6 +16,19 @@ robo_stp_engine --selftest     # scrive due cubi colorati in STEP e IGES, li ril
 robo_stp_engine --version
 ```
 
+Opzioni per i file grandi (usate da robo importer 0.7):
+
+- `--instances 1` (anche STEP e IGES): un pezzo che compare piu' volte nell'assieme arriva come **una definizione** (nelle sue
+  coordinate) e le sue **istanze** (posizione = matrice), cosi' SketchUp lo costruisce una volta sola. Provato su un assieme reale:
+  796.568 triangoli da costruire diventano 159.578 (35 definizioni, 230 istanze).
+- `--max-triangles N` (anche STEP e IGES): se la triangolazione supera N triangoli da costruire, `cpp/bridge.cpp` allarga la
+  tolleranza in proporzione e triangola di nuovo (al massimo 4 volte). Ogni pezzo si triangola una volta sola.
+- `--soften GRADI`: scrive anche le **linee morbide** (`src/spigoli.rs`): per ogni triangolo, quali lati stanno fra due facce
+  che piegano meno di GRADI. I punti uguali (entro 0,001 mm) si uniscono con una griglia che guarda anche le 26 celle vicine.
+  Il file esce nella versione 4 del formato (`src/rstp.rs`). 343.000 triangoli in 0,05 s.
+- Il motore lavora a **priorita' sotto la normale** e lascia libero un processore (i suoi fili di lavoro e quelli di
+  OpenCascade), cosi' il computer resta usabile mentre legge.
+
 `robo_stp_engine_silent.exe` è lo stesso programma senza finestra nera: è quello che usa il plugin.
 
 ## Compilare

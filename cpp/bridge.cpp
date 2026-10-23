@@ -5,11 +5,14 @@
 
 #include <BRepMesh_IncrementalMesh.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
+#include <BRepTools.hxx>
 #include <BRep_Tool.hxx>
 #include <IFSelect_ReturnStatus.hxx>
 #include <IGESCAFControl_Reader.hxx>
 #include <IGESCAFControl_Writer.hxx>
 #include <Interface_Static.hxx>
+#include <OSD_Parallel.hxx>
+#include <OSD_ThreadPool.hxx>
 #include <Poly_Triangulation.hxx>
 #include <Quantity_Color.hxx>
 #include <STEPCAFControl_Reader.hxx>
@@ -17,9 +20,11 @@
 #include <STEPControl_StepModelType.hxx>
 #include <Standard_Failure.hxx>
 #include <Standard_Version.hxx>
+#include <TCollection_AsciiString.hxx>
 #include <TCollection_ExtendedString.hxx>
 #include <TDF_Label.hxx>
 #include <TDF_LabelSequence.hxx>
+#include <TDF_Tool.hxx>
 #include <TDataStd_Name.hxx>
 #include <TDocStd_Document.hxx>
 #include <TopExp_Explorer.hxx>
@@ -34,7 +39,9 @@
 #include <gp_Pnt.hxx>
 #include <gp_Trsf.hxx>
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -97,10 +104,22 @@ struct Ctx {
   Handle(XCAFDoc_ShapeTool) st;
   Handle(XCAFDoc_ColorTool) ct;
   double lin = 0.1, ang = 0.5;
-  rstp_part_cb cb = nullptr;
+  rstp_item_cb cb = nullptr;
   void* user = nullptr;
+  bool instances = false;
   std::map<std::string, int> seen;  // quante volte e' gia' comparso un nome (istanze dello stesso pezzo)
+  std::map<std::string, int> uses;  // quante volte compare ogni pezzo (forma semplice) nell'assieme
+  std::vector<std::string> unique_entries;  // i pezzi, ciascuno una volta: si triangolano una volta sola
+  std::vector<TopoDS_Shape> unique_shapes;
+  std::map<std::string, std::vector<uint32_t>> defs;  // pezzo ripetuto -> le sue definizioni (una per colore)
+  uint32_t next_id = 1;
 };
+
+std::string entry_of(const TDF_Label& l) {
+  TCollection_AsciiString e;
+  TDF_Tool::Entry(l, e);
+  return std::string(e.ToCString());
+}
 
 bool color_of(const Ctx& c, const TDF_Label& l, Quantity_Color& out) {
   return c.ct->GetColor(l, XCAFDoc_ColorSurf, out) || c.ct->GetColor(l, XCAFDoc_ColorGen, out);
@@ -116,14 +135,15 @@ std::array<float, 4> to_rgba(const Quantity_Color& q) {
   return {{static_cast<float>(r), static_cast<float>(g), static_cast<float>(b), 1.f}};
 }
 
-void emit(Ctx& c, const TDF_Label& label, const TopLoc_Location& parent, const std::string& name) {
+// I triangoli di un pezzo, divisi per colore, portati con la posizione `parent`.
+std::map<std::array<int, 4>, Bucket> collect(Ctx& c, const TDF_Label& label, const TopLoc_Location& parent) {
+  std::map<std::array<int, 4>, Bucket> buckets;
   TopoDS_Shape shape = XCAFDoc_ShapeTool::GetShape(label);
-  if (shape.IsNull()) return;
-  BRepMesh_IncrementalMesh mesher(shape, c.lin, Standard_False, c.ang, Standard_True);
+  if (shape.IsNull()) return buckets;
+  BRepMesh_IncrementalMesh mesher(shape, c.lin, Standard_False, c.ang, Standard_True);  // gia' fatto: non rifa' nulla
 
   Quantity_Color part_color;
   const bool has_part_color = color_of(c, label, part_color);
-  std::map<std::array<int, 4>, Bucket> buckets;
 
   for (TopExp_Explorer ex(shape, TopAbs_FACE); ex.More(); ex.Next()) {
     const TopoDS_Face face = TopoDS::Face(ex.Current());
@@ -158,11 +178,117 @@ void emit(Ctx& c, const TDF_Label& label, const TopLoc_Location& parent, const s
       b.idx.push_back(base + static_cast<uint32_t>(n3 - 1));
     }
   }
-  for (auto& kv : buckets) {
+  return buckets;
+}
+
+// Le immagini degli assi x, y, z e la traslazione di una posizione (12 valori).
+void matrix_of(const gp_Trsf& t, float* m) {
+  for (int j = 1; j <= 3; ++j)
+    for (int i = 1; i <= 3; ++i) m[(3 * (j - 1)) + (i - 1)] = static_cast<float>(t.Value(i, j));
+  const gp_XYZ p = t.TranslationPart();
+  m[9] = static_cast<float>(p.X());
+  m[10] = static_cast<float>(p.Y());
+  m[11] = static_cast<float>(p.Z());
+}
+
+// Un pezzo: le sue parti nella posizione finale; oppure, se compare piu' volte e le istanze sono chieste, la definizione (la
+// prima volta) e un'istanza in questa posizione.
+void emit(Ctx& c, const TDF_Label& label, const TopLoc_Location& parent, const std::string& name) {
+  const std::string entry = entry_of(label);
+  if (c.instances && c.uses[entry] > 1) {
+    auto it = c.defs.find(entry);
+    if (it == c.defs.end()) {
+      std::string def_name = label_name(label);
+      if (def_name.empty()) def_name = "Parte";
+      std::vector<uint32_t> ids;
+      for (auto& kv : collect(c, label, TopLoc_Location())) {
+        Bucket& b = kv.second;
+        if (b.idx.empty()) continue;
+        const uint32_t id = c.next_id++;
+        ids.push_back(id);
+        c.cb(c.user, 1, id, def_name.c_str(), b.rgba.data(), b.v.size() / 3, b.v.data(), b.idx.size() / 3, b.idx.data(), nullptr);
+      }
+      it = c.defs.emplace(entry, ids).first;
+    }
+    float m[12];
+    matrix_of(parent.Transformation(), m);
+    for (uint32_t id : it->second) c.cb(c.user, 2, id, name.c_str(), nullptr, 0, nullptr, 0, nullptr, m);
+    return;
+  }
+  for (auto& kv : collect(c, label, parent)) {
     Bucket& b = kv.second;
     if (b.idx.empty()) continue;
-    c.cb(c.user, name.c_str(), b.rgba.data(), b.v.size() / 3, b.v.data(), b.idx.size() / 3, b.idx.data());
+    c.cb(c.user, 0, 0, name.c_str(), b.rgba.data(), b.v.size() / 3, b.v.data(), b.idx.size() / 3, b.idx.data(), nullptr);
   }
+}
+
+// Prima passata: quante volte compare ogni pezzo (per le istanze e per contare i triangoli).
+void count(Ctx& c, const TDF_Label& label, int depth) {
+  if (depth > 64) return;
+  if (XCAFDoc_ShapeTool::IsReference(label)) {
+    TDF_Label ref;
+    if (XCAFDoc_ShapeTool::GetReferredShape(label, ref)) count(c, ref, depth + 1);
+    return;
+  }
+  if (XCAFDoc_ShapeTool::IsAssembly(label)) {
+    TDF_LabelSequence comps;
+    XCAFDoc_ShapeTool::GetComponents(label, comps);
+    for (Standard_Integer i = 1; i <= comps.Length(); ++i) count(c, comps.Value(i), depth + 1);
+  } else if (XCAFDoc_ShapeTool::IsSimpleShape(label)) {
+    const std::string entry = entry_of(label);
+    if (c.uses[entry]++ == 0) {
+      c.unique_entries.push_back(entry);
+      c.unique_shapes.push_back(XCAFDoc_ShapeTool::GetShape(label));
+    }
+  }
+}
+
+uint64_t triangles_of(const TopoDS_Shape& shape) {
+  uint64_t n = 0;
+  for (TopExp_Explorer ex(shape, TopAbs_FACE); ex.More(); ex.Next()) {
+    TopLoc_Location loc;
+    Handle(Poly_Triangulation) tri = BRep_Tool::Triangulation(TopoDS::Face(ex.Current()), loc);
+    if (!tri.IsNull()) n += static_cast<uint64_t>(tri->NbTriangles());
+  }
+  return n;
+}
+
+// Triangola ogni pezzo una volta e conta i triangoli che arriveranno a SketchUp: con le istanze un pezzo ripetuto si
+// costruisce una volta sola.
+uint64_t mesh_all(Ctx& c) {
+  uint64_t total = 0;
+  for (size_t i = 0; i < c.unique_shapes.size(); ++i) {
+    const TopoDS_Shape& s = c.unique_shapes[i];
+    if (s.IsNull()) continue;
+    BRepMesh_IncrementalMesh mesher(s, c.lin, Standard_False, c.ang, Standard_True);
+    const uint64_t n = triangles_of(s);
+    total += c.instances ? n : n * static_cast<uint64_t>(c.uses[c.unique_entries[i]]);
+  }
+  return total;
+}
+
+// Oltre il tetto: la tolleranza si allarga in proporzione ai triangoli in piu' (piu' o meno inversa al loro numero) e si
+// triangola di nuovo, al massimo quattro volte.
+void fit_to(Ctx& c, uint64_t max_triangles) {
+  uint64_t total = mesh_all(c);
+  if (max_triangles == 0) return;
+  for (int round = 0; round < 4 && static_cast<double>(total) > static_cast<double>(max_triangles) * 1.05; ++round) {
+    const double f = static_cast<double>(total) / static_cast<double>(max_triangles);
+    c.lin *= f * 1.15;
+    c.ang = std::min(c.ang * std::sqrt(f), 1.2);
+    for (const TopoDS_Shape& s : c.unique_shapes)
+      if (!s.IsNull()) BRepTools::Clean(s);
+    total = mesh_all(c);
+  }
+}
+
+// OpenCascade triangola in parallelo: si lascia libero un processore, cosi' il computer resta usabile.
+void limit_threads() {
+  static bool done = false;
+  if (done) return;
+  done = true;
+  const int n = OSD_Parallel::NbLogicalProcessors();
+  OSD_ThreadPool::DefaultPool(n > 2 ? n - 1 : 1);
 }
 
 void visit(Ctx& c, const TDF_Label& label, const TopLoc_Location& parent, const std::string& path, int depth) {
@@ -199,9 +325,10 @@ extern "C" {
 
 const char* rstp_occt_version(void) { return OCC_VERSION_STRING_EXT; }
 
-int rstp_load(const char* path, int format, double lin, double ang, rstp_part_cb cb, void* user, char* err,
-              uint32_t err_len) {
+int rstp_load(const char* path, int format, double lin, double ang, uint64_t max_triangles, int instances, rstp_item_cb cb,
+              void* user, double* used_linear, char* err, uint32_t err_len) {
   try {
+    limit_threads();
     Interface_Static::SetCVal("xstep.cascade.unit", "MM");
     Handle(TDocStd_Document) doc = new_doc();
     if (format == 1) {
@@ -237,12 +364,16 @@ int rstp_load(const char* path, int format, double lin, double ang, rstp_part_cb
     c.ang = ang;
     c.cb = cb;
     c.user = user;
+    c.instances = instances != 0;
     TDF_LabelSequence roots;
     c.st->GetFreeShapes(roots);
     if (roots.Length() == 0) {
       set_err(err, err_len, "il file non contiene forme");
       return 4;
     }
+    for (Standard_Integer i = 1; i <= roots.Length(); ++i) count(c, roots.Value(i), 0);
+    fit_to(c, max_triangles);
+    if (used_linear) *used_linear = c.lin;
     for (Standard_Integer i = 1; i <= roots.Length(); ++i) visit(c, roots.Value(i), TopLoc_Location(), std::string(), 0);
     return 0;
   } catch (const Standard_Failure& e) {
@@ -257,7 +388,7 @@ int rstp_load(const char* path, int format, double lin, double ang, rstp_part_cb
   }
 }
 
-int rstp_write_test_box(const char* path, int format, char* err, uint32_t err_len) {
+int rstp_write_test_box(const char* path, int format, int repeated, char* err, uint32_t err_len) {
   try {
     Handle(TDocStd_Document) doc = new_doc();
     Handle(XCAFDoc_ShapeTool) st = XCAFDoc_DocumentTool::ShapeTool(doc->Main());
@@ -276,6 +407,11 @@ int rstp_write_test_box(const char* path, int format, char* err, uint32_t err_le
     move.SetTranslation(gp_Vec(30.0, 0.0, 0.0));
     st->AddComponent(assembly, red, TopLoc_Location());
     st->AddComponent(assembly, blue, TopLoc_Location(move));
+    if (repeated) {
+      gp_Trsf up;
+      up.SetTranslation(gp_Vec(0.0, 0.0, 50.0));
+      st->AddComponent(assembly, red, TopLoc_Location(up));
+    }
     st->UpdateAssemblies();
 
     if (format == 1) {

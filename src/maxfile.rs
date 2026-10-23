@@ -4,9 +4,9 @@
 //! E' un contenitore OLE (CFB) con uno stream «Scene» fatto di blocchi (id u16, lunghezza u32 o u64, bit alto = contiene altri blocchi).
 //! Si leggono: nomi e gerarchia dei nodi, posizione/rotazione/scala (controller fissi), offset dell'oggetto,
 //! e la geometria degli oggetti **Editable Mesh** e **Editable Poly** (anche sotto una pila di modificatori: si prende
-//! l'oggetto di base, i modificatori non vengono applicati). Spline, forme, luci, camere, materiali e texture non si importano.
+//! l'oggetto di base, i modificatori non vengono applicati). Spline, forme, luci, camere e texture non si importano; dei materiali si legge solo il colore diffuso dei materiali V-Ray (uno per oggetto).
 
-use crate::ffi::Parte;
+use crate::ffi::{Parte, Texture};
 use crate::rstp::Voce;
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet};
@@ -105,6 +105,7 @@ fn leggi_classi(dati: &[u8]) -> Vec<Classe> {
 const CL_MESH: (u32, u32) = (0xe44f_10b3, 0);
 const CL_POLY: (u32, u32) = (0x1bf8_338d, 0x192f_6098);
 const CL_NODO: (u32, u32) = (1, 0);
+const CL_VRAY: (u32, u32) = (0x37bf_3f2f, 0x7034_695c);
 const CL_DERIVATO: u16 = 0x2032; // «oggetto derivato»: pila di modificatori con l'oggetto di base per ultimo
 
 /// Matrice 4x3 con i vettori riga come in 3ds Max: p' = p * M.
@@ -189,6 +190,8 @@ struct Nodo {
 struct Geometria {
     vertici: Vec<[f32; 3]>,
     triangoli: Vec<[u32; 3]>,
+    /// Coordinate di mappatura (u, v) dei tre angoli di ogni triangolo, se sono state chieste e il file le ha.
+    uv: Option<Vec<[[f32; 2]; 3]>>,
 }
 
 /// Cosa e' successo nella lettura.
@@ -222,11 +225,13 @@ pub struct OpzioniMax {
     pub oggetto_max_triangoli: Option<usize>,
     /// Ignora gli oggetti piu' piccoli di questa frazione della scena (per l'anteprima).
     pub piccoli_relativi: Option<f64>,
+    /// Legge anche l'immagine dei materiali e la mappatura (UV).
+    pub uv: bool,
 }
 
 impl OpzioniMax {
     pub fn semplici(mm_per_unita: f64) -> OpzioniMax {
-        OpzioniMax { mm_per_unita, istanze: false, max_triangoli: None, dimensione_minima_mm: None, oggetto_max_triangoli: None, piccoli_relativi: None }
+        OpzioniMax { mm_per_unita, istanze: false, max_triangoli: None, dimensione_minima_mm: None, oggetto_max_triangoli: None, piccoli_relativi: None, uv: false }
     }
 }
 
@@ -234,6 +239,8 @@ pub struct FileMax {
     scena: Vec<u8>,
     blocchi: Vec<Blocco>,
     classi: Vec<Classe>,
+    /// Le immagini del file: identificativo (16 byte) -> percorso, dallo stream «FileAssetMetaData3».
+    immagini: Vec<([u8; 16], String)>,
 }
 
 impl FileMax {
@@ -255,7 +262,17 @@ impl FileMax {
         let alto = blocchi(&scena, 0, scena.len());
         let radice = alto.first().filter(|b| b.contenitore).context("la scena non ha la struttura attesa (file di una versione di 3ds Max non riconosciuta?)")?;
         let blocchi = blocchi_di(&scena, radice);
-        Ok(FileMax { scena, blocchi, classi })
+        let immagini = {
+            let mut d = Vec::new();
+            match cfb.open_stream("/FileAssetMetaData3") {
+                Ok(mut st) => {
+                    let _ = st.read_to_end(&mut d);
+                    leggi_immagini(&decomprimi(d).unwrap_or_default())
+                }
+                Err(_) => Vec::new(),
+            }
+        };
+        Ok(FileMax { scena, blocchi, classi, immagini })
     }
 
     fn classe(&self, pos: usize) -> Option<(u32, u32)> {
@@ -368,14 +385,151 @@ impl FileMax {
         None
     }
 
-    fn geometria(&self, pos: usize) -> Option<(Geometria, bool)> {
+    /// Il colore del materiale assegnato a un nodo (nel riferimento 3): quello «diffuso» del primo materiale V-Ray che si trova,
+    /// anche dentro Multi/Sub-Object, Double Sided e simili (di un Multi/Sub-Object si usa il primo sotto-materiale).
+    /// I materiali Standard e le texture non si leggono: in quel caso None.
+    fn colore_nodo(&self, nodo: &Nodo) -> Option<[f32; 4]> {
+        let mut coda = vec![(*nodo.riferimenti.get(&3)?, 0usize)];
+        let mut visti = HashSet::new();
+        while !coda.is_empty() {
+            let (pos, livello) = coda.remove(0);
+            if pos >= self.blocchi.len() || !visti.insert(pos) {
+                continue;
+            }
+            if self.classe(pos) == Some(CL_VRAY) {
+                return self.diffuso_vray(pos);
+            }
+            if livello < 4 {
+                for r in self.riferimenti_slot(pos) {
+                    coda.push((r, livello + 1));
+                }
+            }
+        }
+        None
+    }
+
+    /// I riferimenti di un blocco: sia nella forma «coppie (posizione, riferimento)» (0x2035) sia in quella a elenco (0x2034).
+    fn riferimenti_slot(&self, pos: usize) -> Vec<usize> {
+        let b = &self.scena;
+        let c = &self.blocchi[pos];
+        if let Some(f) = figlio(b, c, 0x2035) {
+            let w = dword_lista(b, &f);
+            return w.get(1..).unwrap_or(&[]).chunks(2).filter(|p| p.len() == 2).map(|p| p[1] as usize).collect();
+        }
+        self.riferimenti(pos).into_iter().map(|r| r as usize).collect()
+    }
+
+    /// Il colore «diffuso» di un materiale V-Ray: il parametro 1 (tipo colore) del suo primo ParamBlock2.
+    fn diffuso_vray(&self, pos: usize) -> Option<[f32; 4]> {
+        let b = &self.scena;
+        let f = figlio(b, &self.blocchi[pos], 0x2035)?;
+        let w = dword_lista(b, &f);
+        let blocco = w.get(1..)?.chunks(2).find(|p| p.len() == 2 && p[0] == 1).map(|p| p[1] as usize)?;
+        let pb = self.blocchi.get(blocco)?;
+        for e in figli(b, pb) {
+            // id (u16), tipo (u16), 11 byte di intestazione, poi i valori; il tipo 2 e' un colore (3 numeri decimali)
+            if (e.id == 0x100e || e.id == 0x000e) && e.e - e.s >= 27 && u16::from_le_bytes([b[e.s], b[e.s + 1]]) == 1 && u16::from_le_bytes([b[e.s + 2], b[e.s + 3]]) == 2 {
+                let c = |i: usize| f32_at(b, e.s + 15 + i * 4).clamp(0.0, 1.0);
+                return Some([c(0), c(1), c(2), 1.0]);
+            }
+        }
+        None
+    }
+
+    /// L'immagine (texture) del materiale di un nodo: la prima immagine che si trova scendendo nel materiale,
+    /// anche dentro Multi/Sub-Object e simili. Il percorso e' quello salvato nel file .max.
+    fn immagine_nodo(&self, nodo: &Nodo) -> Option<String> {
+        if self.immagini.is_empty() {
+            return None;
+        }
+        let mut coda = vec![(*nodo.riferimenti.get(&3)?, 0usize)];
+        let mut visti = HashSet::new();
+        while !coda.is_empty() {
+            let (pos, livello) = coda.remove(0);
+            if pos >= self.blocchi.len() || !visti.insert(pos) {
+                continue;
+            }
+            let c = &self.blocchi[pos];
+            let dati = &self.scena[c.s..c.e];
+            if let Some((_, nome)) = self.immagini.iter().find(|(g, _)| dati.windows(16).any(|w| w == g)) {
+                return Some(nome.clone());
+            }
+            if livello < 5 {
+                for r in self.riferimenti_slot(pos) {
+                    coda.push((r, livello + 1));
+                }
+            }
+        }
+        None
+    }
+
+    /// Il canale di mappatura 1 di un oggetto Editable Mesh: (coordinate, facce di coordinate).
+    fn uv_mesh(&self, m: &Blocco) -> Option<(Vec<[f32; 2]>, Vec<[u32; 3]>)> {
+        let b = &self.scena;
+        let tutti = figli(b, m);
+        let da = tutti.iter().position(|f| f.id == 0x959 && f.e - f.s >= 4 && u32_at(b, f.s) == 1)?;
+        let (mut punti, mut facce) = (None, None);
+        for f in tutti[da + 1..].iter().take_while(|f| f.id != 0x959) {
+            match f.id {
+                0x2394 if f.e - f.s >= 4 => {
+                    let n = u32_at(b, f.s) as usize;
+                    if f.e - f.s >= 4 + n * 12 {
+                        punti = Some((0..n).map(|i| [f32_at(b, f.s + 4 + i * 12), f32_at(b, f.s + 8 + i * 12)]).collect::<Vec<_>>());
+                    }
+                }
+                0x2396 if f.e - f.s >= 4 => {
+                    let n = u32_at(b, f.s) as usize;
+                    if f.e - f.s >= 4 + n * 12 {
+                        facce = Some((0..n).map(|i| [u32_at(b, f.s + 4 + i * 12), u32_at(b, f.s + 8 + i * 12), u32_at(b, f.s + 12 + i * 12)]).collect::<Vec<_>>());
+                    }
+                }
+                _ => {}
+            }
+        }
+        Some((punti?, facce?))
+    }
+
+    /// Il canale di mappatura 1 di un oggetto Editable Poly: (coordinate, per ogni faccia gli indici delle coordinate dei suoi angoli).
+    fn uv_poly(&self, m: &Blocco) -> Option<(Vec<[f32; 2]>, Vec<Vec<u32>>)> {
+        let b = &self.scena;
+        let tutti = figli(b, m);
+        let da = tutti.iter().position(|f| f.id == 0x124 && f.e - f.s >= 4 && u32_at(b, f.s) == 1)?;
+        let (mut punti, mut facce) = (None, None);
+        for f in tutti[da + 1..].iter().take_while(|f| f.id != 0x124) {
+            match f.id {
+                0x128 if f.e - f.s >= 4 => {
+                    let n = u32_at(b, f.s) as usize;
+                    if f.e - f.s >= 4 + n * 12 {
+                        punti = Some((0..n).map(|i| [f32_at(b, f.s + 4 + i * 12), f32_at(b, f.s + 8 + i * 12)]).collect::<Vec<_>>());
+                    }
+                }
+                0x12b => {
+                    let mut v = Vec::new();
+                    let mut p = f.s;
+                    while p + 4 <= f.e {
+                        let g = u32_at(b, p) as usize;
+                        if g > 4096 || p + 4 + 4 * g > f.e {
+                            return None;
+                        }
+                        v.push((0..g).map(|k| u32_at(b, p + 4 + 4 * k)).collect::<Vec<u32>>());
+                        p += 4 + 4 * g;
+                    }
+                    facce = Some(v);
+                }
+                _ => {}
+            }
+        }
+        Some((punti?, facce?))
+    }
+
+    fn geometria(&self, pos: usize, uv: bool) -> Option<(Geometria, bool)> {
         match self.classe(pos)? {
-            CL_MESH => self.mesh(pos).map(|g| (g, true)),
-            _ => self.poligoni(pos),
+            CL_MESH => self.mesh(pos, uv).map(|g| (g, true)),
+            _ => self.poligoni(pos, uv),
         }
     }
 
-    fn mesh(&self, pos: usize) -> Option<Geometria> {
+    fn mesh(&self, pos: usize, con_uv: bool) -> Option<Geometria> {
         let b = &self.scena;
         let m = figlio(b, &self.blocchi[pos], 0x8fe)?;
         let v = figlio(b, &m, 0x914)?;
@@ -386,19 +540,25 @@ impl FileMax {
             return None;
         }
         let vertici = (0..nv).map(|i| [f32_at(b, v.s + 4 + i * 12), f32_at(b, v.s + 8 + i * 12), f32_at(b, v.s + 12 + i * 12)]).collect();
+        let mappa = if con_uv { self.uv_mesh(&m) } else { None };
         let mut triangoli = Vec::with_capacity(nf);
+        let mut uv: Option<Vec<[[f32; 2]; 3]>> = mappa.as_ref().map(|_| Vec::with_capacity(nf));
         for i in 0..nf {
             let p = f.s + 4 + i * 20;
             let t = [u32_at(b, p), u32_at(b, p + 4), u32_at(b, p + 8)];
             if t.iter().all(|&x| (x as usize) < nv) {
                 triangoli.push(t);
+                if let (Some((punti, facce)), Some(u)) = (&mappa, uv.as_mut()) {
+                    let angolo = |k: usize| facce.get(i).and_then(|tf| punti.get(tf[k] as usize)).copied().unwrap_or([0.0, 0.0]);
+                    u.push([angolo(0), angolo(1), angolo(2)]);
+                }
             }
         }
-        Some(Geometria { vertici, triangoli })
+        Some(Geometria { vertici, triangoli, uv })
     }
 
     /// Editable Poly: (geometria, true se le facce sono state lette tutte).
-    fn poligoni(&self, pos: usize) -> Option<(Geometria, bool)> {
+    fn poligoni(&self, pos: usize, con_uv: bool) -> Option<(Geometria, bool)> {
         let b = &self.scena;
         let m = figlio(b, &self.blocchi[pos], 0x8fe)?;
         let v = figlio(b, &m, 0x100)?;
@@ -424,11 +584,21 @@ impl FileMax {
             }
         }
         let (facce, ok) = leggi_facce(&b[f.s..f.e], nv)?;
+        let mappa = if con_uv { self.uv_poly(&m).filter(|(_, tf)| tf.len() == facce.len()) } else { None };
         let mut triangoli = Vec::new();
-        for fc in &facce {
+        let mut uv: Option<Vec<[[f32; 2]; 3]>> = mappa.as_ref().map(|_| Vec::new());
+        for (i, fc) in facce.iter().enumerate() {
+            let prima = triangoli.len();
             triangola(fc, &vertici, &mut triangoli);
+            if let (Some((punti, tf)), Some(u)) = (&mappa, uv.as_mut()) {
+                // l'angolo di un triangolo e' un vertice della faccia: la sua coordinata e' quella allo stesso posto nella faccia delle coordinate
+                let angolo = |v: u32| fc.iter().position(|&x| x == v).and_then(|k| tf[i].get(k)).and_then(|&c| punti.get(c as usize)).copied().unwrap_or([0.0, 0.0]);
+                for t in &triangoli[prima..] {
+                    u.push([angolo(t[0]), angolo(t[1]), angolo(t[2])]);
+                }
+            }
         }
-        Some((Geometria { vertici, triangoli }, ok))
+        Some((Geometria { vertici, triangoli, uv }, ok))
     }
 
     /// Legge il file e restituisce le voci (in millimetri) e il resoconto.
@@ -443,7 +613,7 @@ impl FileMax {
         let mut basi: Vec<usize> = posizioni.iter().filter_map(|p| self.oggetto_base(&nodi[p])).collect();
         basi.sort_unstable();
         basi.dedup();
-        for (b, g) in basi.iter().copied().zip(in_parallelo(&basi, |&b| self.geometria(b))) {
+        for (b, g) in basi.iter().copied().zip(in_parallelo(&basi, |&b| self.geometria(b, o.uv))) {
             cache.insert(b, g);
         }
         // 1. i nodi con una geometria, e i filtri
@@ -461,7 +631,7 @@ impl FileMax {
                 }
                 continue;
             };
-            let g = cache.entry(base).or_insert_with(|| self.geometria(base));
+            let g = cache.entry(base).or_insert_with(|| self.geometria(base, o.uv));
             let Some((g, ok)) = g else {
                 res.non_supportati += 1;
                 continue;
@@ -581,8 +751,19 @@ impl FileMax {
             }
             (vertici, g.triangoli.iter().flatten().copied().collect())
         };
+        // l'immagine e la mappatura di un oggetto: solo se la geometria ha le coordinate e il materiale ha un'immagine
+        let texture_di = |pos: usize, g: &Geometria| -> Option<Texture> {
+            let uv = g.uv.as_ref()?;
+            if uv.len() != g.triangoli.len() {
+                return None;
+            }
+            let file = nodi.get(&pos).and_then(|n| self.immagine_nodo(n))?;
+            Some(texture_da_angoli(file, g, uv))
+        };
         let mut voci = Vec::new();
         let mut definite: HashMap<usize, u32> = HashMap::new();
+        let mut colori: HashMap<usize, Option<[f32; 4]>> = HashMap::new();
+        let mut colore_di = |pos: usize| *colori.entry(pos).or_insert_with(|| nodi.get(&pos).and_then(|n| self.colore_nodo(n)));
         for u in &usi {
             let Some(Some((g, _))) = cache.get(&u.base) else { continue };
             let nome = percorso_nome(u.pos, &nodi);
@@ -592,7 +773,8 @@ impl FileMax {
                     None => {
                         let id = definite.len() as u32;
                         let (vertici, triangoli) = in_mm(g, None);
-                        voci.push(Voce::Definizione(id, Parte { nome: nome.clone(), colore: None, vertici, triangoli }));
+                        let colore = colore_di(u.pos);
+                        voci.push(Voce::Definizione(id, Parte { nome: nome.clone(), colore, vertici, triangoli, texture: texture_di(u.pos, g) }));
                         definite.insert(u.base, id);
                         id
                     }
@@ -616,7 +798,8 @@ impl FileMax {
                 res.istanze += 1;
             } else {
                 let (vertici, triangoli) = in_mm(g, Some(&u.m));
-                voci.push(Voce::Geometria(Parte { nome, colore: None, vertici, triangoli }));
+                let colore = colore_di(u.pos);
+                voci.push(Voce::Geometria(Parte { nome, colore, vertici, triangoli, texture: texture_di(u.pos, g) }));
             }
             res.con_geometria += 1;
         }
@@ -643,6 +826,61 @@ impl FileMax {
         }
         m
     }
+}
+
+/// Le immagini salvate nel file: per ognuna un identificativo di 16 byte, il nome della classe, il nome del file e il percorso.
+/// Ogni voce: 16 byte, poi tre testi (u32 lunghezza in caratteri, UTF-16, uno zero finale). Si tengono le immagini «Bitmap».
+fn leggi_immagini(d: &[u8]) -> Vec<([u8; 16], String)> {
+    let mut v = Vec::new();
+    let mut p = 0usize;
+    'voci: while p + 16 <= d.len() {
+        let id: [u8; 16] = d[p..p + 16].try_into().unwrap();
+        p += 16;
+        let mut testi = Vec::with_capacity(3);
+        for _ in 0..3 {
+            if p + 4 > d.len() {
+                break 'voci;
+            }
+            let n = u32_at(d, p) as usize;
+            p += 4;
+            if n > 4096 || p + n * 2 + 2 > d.len() {
+                break 'voci;
+            }
+            let unita: Vec<u16> = (0..n).map(|k| u16::from_le_bytes([d[p + 2 * k], d[p + 2 * k + 1]])).collect();
+            testi.push(String::from_utf16_lossy(&unita));
+            p += n * 2 + 2;
+        }
+        if testi[0] == "Bitmap" {
+            v.push((id, testi[2].clone()));
+        }
+    }
+    v
+}
+
+/// Dalle coordinate dei tre angoli di ogni triangolo: una coordinata per vertice, e i triangoli che toccano un vertice
+/// con coordinate diverse da un triangolo all'altro (bordi della mappatura), con le loro coordinate.
+fn texture_da_angoli(file: String, g: &Geometria, uv: &[[[f32; 2]; 3]]) -> Texture {
+    let mut per_vertice: Vec<Option<[f32; 2]>> = vec![None; g.vertici.len()];
+    let mut diverso = vec![false; g.vertici.len()];
+    for (t, a) in g.triangoli.iter().zip(uv) {
+        for k in 0..3 {
+            let v = t[k] as usize;
+            match per_vertice[v] {
+                None => per_vertice[v] = Some(a[k]),
+                Some(u) if (u[0] - a[k][0]).abs() > 1e-5 || (u[1] - a[k][1]).abs() > 1e-5 => diverso[v] = true,
+                _ => {}
+            }
+        }
+    }
+    let bordi = g
+        .triangoli
+        .iter()
+        .zip(uv)
+        .enumerate()
+        .filter(|(_, (t, _))| t.iter().any(|&v| diverso[v as usize]))
+        .map(|(i, (_, a))| (i as u32, [a[0][0], a[0][1], a[1][0], a[1][1], a[2][0], a[2][1]]))
+        .collect();
+    Texture { file, uv: per_vertice.iter().flat_map(|u| u.unwrap_or([0.0, 0.0])).collect(), bordi }
 }
 
 fn blocchi_di(scena: &[u8], radice: &Blocco) -> Vec<Blocco> {
@@ -914,6 +1152,7 @@ pub fn semplifica_parti(parti: &mut [Parte], totale: usize) {
     let nuove = in_parallelo(&pesanti, |&i| {
         let p = &lette[i];
         let g = Geometria {
+            uv: None,
             vertici: (0..p.vertici.len() / 3).map(|k| [p.vertici[3 * k], p.vertici[3 * k + 1], p.vertici[3 * k + 2]]).collect(),
             triangoli: (0..p.triangoli.len() / 3).map(|k| [p.triangoli[3 * k], p.triangoli[3 * k + 1], p.triangoli[3 * k + 2]]).collect(),
         };
@@ -980,10 +1219,12 @@ fn dimensione_massima(g: &Geometria, m: &Mat) -> f64 {
     (0..3).map(|i| hi[i] - lo[i]).fold(0.0, f64::max)
 }
 
-/// Esegue `f` su ogni voce usando tutti i processori; i risultati sono nello stesso ordine delle voci.
-fn in_parallelo<T: Sync, R: Send>(voci: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+/// Esegue `f` su ogni voce usando tutti i processori meno uno (il computer resta usabile); i risultati sono nello stesso ordine
+/// delle voci.
+pub(crate) fn in_parallelo<T: Sync, R: Send>(voci: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    let n = std::thread::available_parallelism().map_or(2, |n| n.get()).min(voci.len()).max(1);
+    let processori = std::thread::available_parallelism().map_or(2, |n| n.get());
+    let n = processori.saturating_sub(1).max(1).min(voci.len()).max(1);
     if n == 1 {
         return voci.iter().map(&f).collect();
     }
@@ -1046,7 +1287,7 @@ type MappaVeloce<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<HashVeloce>
 /// (la media); la griglia si infittisce o si allarga fino a stare sotto `obiettivo` triangoli. Veloce, ma perde i dettagli piccoli.
 fn semplifica(g: &Geometria, obiettivo: usize) -> Geometria {
     if g.triangoli.len() <= obiettivo {
-        return Geometria { vertici: g.vertici.clone(), triangoli: g.triangoli.clone() };
+        return Geometria { vertici: g.vertici.clone(), triangoli: g.triangoli.clone(), uv: g.uv.clone() };
     }
     let (mut mn, mut mx) = ([f32::MAX; 3], [f32::MIN; 3]);
     for t in &g.triangoli {
@@ -1125,7 +1366,7 @@ fn semplifica(g: &Geometria, obiettivo: usize) -> Geometria {
             triangoli.push([a, b, k]);
         }
     }
-    Geometria { vertici, triangoli }
+    Geometria { vertici, triangoli, uv: None }
 }
 
 #[cfg(test)]
@@ -1366,7 +1607,7 @@ mod test {
                 triangoli.push([a, d, c]);
             }
         }
-        let g = Geometria { vertici, triangoli };
+        let g = Geometria { vertici, triangoli, uv: None };
         let s = semplifica(&g, 800);
         assert!(s.triangoli.len() <= 800 && s.triangoli.len() > 100, "{} triangoli", s.triangoli.len());
         assert!(s.triangoli.iter().flatten().all(|&i| (i as usize) < s.vertici.len()));

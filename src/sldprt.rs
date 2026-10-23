@@ -205,7 +205,7 @@ pub fn carica(percorso: &Path) -> Result<Vec<Parte>> {
         bail!("le liste di visualizzazione del file SolidWorks non contengono superfici leggibili (solidi importati da STEP o formato non riconosciuto)");
     }
     let nome = percorso.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "SolidWorks".into());
-    Ok(vec![Parte { nome, colore: None, vertici, triangoli }])
+    Ok(vec![Parte { nome, colore: None, vertici, triangoli, texture: None }])
 }
 
 #[cfg(test)]

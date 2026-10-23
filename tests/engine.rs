@@ -77,6 +77,51 @@ fn il_formato_di_scambio_conserva_tutto() {
 }
 
 #[test]
+fn pezzi_ripetuti_come_definizione_e_istanze() {
+    use robo_stp_engine::ffi::{carica_voci, scrivi_cubi_ripetuti};
+    use robo_stp_engine::rstp::Voce;
+    let dir = std::env::temp_dir().join("robo_stp_test_ripetuti");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("ripetuti.stp");
+    scrivi_cubi_ripetuti(&file, Formato::Step).unwrap();
+    // senza istanze: tre parti, il rosso due volte (il secondo 50 mm piu' in alto)
+    let parti = carica(&file, 0.1, 0.5).unwrap();
+    assert_eq!(parti.len(), 3);
+    // con le istanze: il rosso e' una definizione (nelle sue coordinate) con due istanze, il blu resta una parte
+    let (voci, _) = carica_voci(&file, 0.1, 0.5, None, true).unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+    let definizioni: Vec<_> = voci.iter().filter_map(|v| if let Voce::Definizione(id, p) = v { Some((*id, p)) } else { None }).collect();
+    assert_eq!(definizioni.len(), 1);
+    let (id, rosso) = definizioni[0];
+    assert_eq!(rosso.colore, Some([1.0, 0.0, 0.0, 1.0]));
+    assert_eq!(limiti(std::slice::from_ref(rosso)), ([0.0, 0.0, 0.0], [20.0, 10.0, 5.0]));
+    let istanze: Vec<_> = voci.iter().filter_map(|v| if let Voce::Istanza { definizione, matrice, .. } = v { Some((*definizione, *matrice)) } else { None }).collect();
+    assert_eq!(istanze.len(), 2);
+    assert!(istanze.iter().all(|(d, _)| *d == id));
+    let mut alture: Vec<f32> = istanze.iter().map(|(_, m)| m[11]).collect();
+    alture.sort_by(f32::total_cmp);
+    assert_eq!(alture, vec![0.0, 50.0]);
+    assert_eq!(istanze[0].1[..9], [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+    assert_eq!(voci.iter().filter(|v| matches!(v, Voce::Geometria(_))).count(), 1);
+}
+
+#[test]
+fn il_tetto_dei_triangoli_allarga_la_tolleranza() {
+    use robo_stp_engine::ffi::carica_voci;
+    use robo_stp_engine::rstp::Voce;
+    // due cubi: 24 triangoli in tutto, qualunque tolleranza; il tetto non puo' scendere sotto, ma non deve rompere nulla
+    let dir = std::env::temp_dir().join("robo_stp_test_tetto");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("tetto.stp");
+    scrivi_cubi_di_prova(&file, Formato::Step).unwrap();
+    let (voci, usata) = carica_voci(&file, 0.1, 0.5, Some(10), false).unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+    let triangoli: usize = voci.iter().map(|v| if let Voce::Geometria(p) = v { p.triangoli.len() / 3 } else { 0 }).sum();
+    assert_eq!(triangoli, 24);
+    assert!(usata > 0.1, "la tolleranza doveva allargarsi: {usata}");
+}
+
+#[test]
 fn errori_chiari() {
     let dir = std::env::temp_dir().join("robo_stp_test_errori");
     std::fs::create_dir_all(&dir).unwrap();
