@@ -9,7 +9,7 @@ const AIUTO: &str = "\
 robo_stp_engine - STEP/IGES con OpenCascade
 
   robo_stp_engine --input FILE.stp|.step|.igs|.iges|.max|.sldprt --output FILE.rstp
-                  [--deflection MM] [--angle RADIANTI] [--error-file FILE]
+                  [--deflection MM] [--angle RADIANTI] [--error-file FILE] [--info-file FILE]
                   [--unit mm|cm|m|in|ft] [--uv 1] [--min-size MM] [--skip-heavy N]   (solo .max)
                   [--instances 1] [--max-triangles N] [--soften GRADI]
   robo_stp_engine --selftest      prova STEP e IGES con due cubi colorati
@@ -27,6 +27,8 @@ robo_stp_engine - STEP/IGES con OpenCascade
 --min-size    .max: ignora gli oggetti piu' piccoli di cosi' (mm, lato maggiore)
 --skip-heavy  .max: ignora gli oggetti con piu' di questi triangoli
 --preview N   anteprima leggera: al massimo N triangoli in tutto (per tutti i formati)
+--estimate L,A,L,A,...  STEP e IGES: quanti triangoli darebbero questi dettagli (tolleranza mm, angolo rad, dal piu' grossolano
+              al piu' fine); nel resoconto, estimate = [[nel modello, da costruire, 1 = misurato / 0 = stimato], ...]
 ";
 
 struct Opzioni {
@@ -39,6 +41,10 @@ struct Opzioni {
     anteprima: Option<usize>,
     /// Le linee morbide da scrivere: l'angolo in gradi.
     morbidi: Option<f64>,
+    /// I dettagli di cui stimare i triangoli (tolleranza, angolo).
+    stime: Vec<(f64, f64)>,
+    /// Dove scrivere anche il resoconto (una riga JSON).
+    info: Option<PathBuf>,
 }
 
 fn leggi_argomenti(args: &[String]) -> Result<Opzioni> {
@@ -49,6 +55,8 @@ fn leggi_argomenti(args: &[String]) -> Result<Opzioni> {
     let (mut istanze, mut max_triangoli, mut dim_minima, mut oggetto_max) = (false, None, None, None);
     let mut anteprima = None;
     let mut morbidi = None;
+    let mut stime = Vec::new();
+    let mut info = None;
     let mut uv = false;
     let mut i = 0;
     while i < args.len() {
@@ -65,8 +73,16 @@ fn leggi_argomenti(args: &[String]) -> Result<Opzioni> {
             "--max-triangles" => max_triangoli = Some(valore(i)?.parse::<usize>().context("--max-triangles non e' un numero intero")?),
             "--min-size" => dim_minima = Some(valore(i)?.replace(',', ".").parse::<f64>().context("--min-size non e' un numero")?),
             "--skip-heavy" => oggetto_max = Some(valore(i)?.parse::<usize>().context("--skip-heavy non e' un numero intero")?),
-            "--soften" => morbidi = Some(valore(i)?.replace(',', ".").parse::<f64>().context("--soften non e' un numero")?.clamp(0.0, 180.0)),
+            "--estimate" => {
+                let numeri: Vec<f64> = valore(i)?.split(',').map(|s| s.trim().parse::<f64>()).collect::<Result<_, _>>().context("--estimate: servono numeri separati da virgole")?;
+                if numeri.len() % 2 != 0 || numeri.iter().any(|&x| !(x > 0.0)) {
+                    bail!("--estimate: servono coppie tolleranza, angolo maggiori di zero");
+                }
+                stime = numeri.chunks(2).map(|c| (c[0], c[1])).collect();
+            }
+            "--soften" => morbidi =Some(valore(i)?.replace(',', ".").parse::<f64>().context("--soften non e' un numero")?.clamp(0.0, 180.0)),
             "--error-file" => {}
+            "--info-file" => info = Some(PathBuf::from(valore(i)?)),
             altro => bail!("opzione sconosciuta: {altro}"),
         }
         i += 2;
@@ -95,7 +111,7 @@ fn leggi_argomenti(args: &[String]) -> Result<Opzioni> {
         angle = angle.max(1.5);
         morbidi = None;
     }
-    Ok(Opzioni { input: input.context("manca --input")?, output: output.context("manca --output")?, deflection, angle, max, anteprima, morbidi })
+    Ok(Opzioni { input: input.context("manca --input")?, output: output.context("manca --output")?, deflection, angle, max, anteprima, morbidi, stime, info })
 }
 
 /// Le voci nel formato chiesto: con le linee morbide (versione 4) o come prima.
@@ -137,11 +153,12 @@ fn converti(o: &Opzioni) -> Result<()> {
     // SolidWorks (.sldprt): si legge la mesh di visualizzazione salvata nel file; gli altri formati vanno a OpenCascade, che
     // con un tetto ai triangoli allarga da se' la tolleranza (l'anteprima invece taglia le parti piu' pesanti, piu' sotto)
     let sldprt = o.input.extension().is_some_and(|e| e.eq_ignore_ascii_case("sldprt"));
-    let (mut voci, tolleranza) = if sldprt {
-        (sldprt::carica(&o.input)?.into_iter().map(rstp::Voce::Geometria).collect::<Vec<_>>(), o.deflection)
+    let (mut voci, tolleranza, stime, sorgente) = if sldprt {
+        (sldprt::carica(&o.input)?.into_iter().map(rstp::Voce::Geometria).collect::<Vec<_>>(), o.deflection, Vec::new(), None)
     } else {
         let tetto = if o.anteprima.is_some() { None } else { o.max.max_triangoli };
-        ffi::carica_voci(&o.input, o.deflection, o.angle, tetto, o.max.istanze && o.anteprima.is_none())?
+        let letto = ffi::carica_voci(&o.input, o.deflection, o.angle, tetto, o.max.istanze && o.anteprima.is_none(), &o.stime)?;
+        (letto.voci, letto.tolleranza, letto.stime, Some((letto.facce_file, letto.bordi_file)))
     };
     if voci.is_empty() {
         bail!("il file non ha prodotto nessuna superficie da importare");
@@ -157,16 +174,31 @@ fn converti(o: &Opzioni) -> Result<()> {
     scrivi(o, &voci)?;
     let (triangoli, unici) = conta(&voci);
     let istanze = voci.iter().filter(|v| matches!(v, rstp::Voce::Istanza { .. })).count();
-    println!(
-        "{{\"parts\":{},\"triangles\":{},\"unique_triangles\":{},\"source_triangles\":{},\"instances\":{},\"deflection\":{},\"occt\":\"{}\"}}",
-        voci.len() - istanze,
-        triangoli,
-        unici,
-        origine,
-        istanze,
-        tolleranza,
-        ffi::versione_occt()
-    );
+    let stime: Vec<String> = stime.iter().map(|s| format!("[{},{},{}]", s.nel_modello, s.da_costruire, u8::from(s.misurata))).collect();
+    resoconto(
+        o,
+        &format!(
+            "{{\"parts\":{},\"triangles\":{},\"unique_triangles\":{},\"source_triangles\":{},\"instances\":{},\"deflection\":{},\"estimate\":[{}],{}\"occt\":\"{}\"}}",
+            voci.len() - istanze,
+            triangoli,
+            unici,
+            origine,
+            istanze,
+            tolleranza,
+            stime.join(","),
+            sorgente.map_or(String::new(), |(f, b)| format!("\"source_faces\":{f},\"source_edges\":{b},")),
+            ffi::versione_occt()
+        ),
+    )
+}
+
+/// Il resoconto (una riga JSON) sull'uscita e, se chiesto, nel file `--info-file`: il programma senza finestra, lanciato da
+/// SketchUp, non porta la sua uscita nel file che il plugin gli da'; un file scritto dal motore stesso arriva sempre.
+fn resoconto(o: &Opzioni, testo: &str) -> Result<()> {
+    println!("{testo}");
+    if let Some(f) = &o.info {
+        std::fs::write(f, format!("{testo}\n")).with_context(|| format!("scrittura di {}", f.display()))?;
+    }
     Ok(())
 }
 
@@ -183,11 +215,13 @@ fn converti_max(o: &Opzioni) -> Result<()> {
     }
     scrivi(o, &voci)?;
     let (totali, unici) = conta(&voci);
-    println!(
-        "{{\"parts\":{},\"triangles\":{},\"source_triangles\":{},\"unique_triangles\":{},\"nodes\":{},\"unsupported\":{},\"unreadable_faces\":{},\"instances\":{},\"skipped_small\":{},\"skipped_heavy\":{},\"simplified\":{}}}",
-        r.con_geometria, totali, r.triangoli_origine, unici, r.nodi, r.non_supportati, r.facce_illeggibili, r.istanze, r.scartati_piccoli, r.scartati_pesanti, r.semplificati
-    );
-    Ok(())
+    resoconto(
+        o,
+        &format!(
+            "{{\"parts\":{},\"triangles\":{},\"source_triangles\":{},\"unique_triangles\":{},\"nodes\":{},\"unsupported\":{},\"unreadable_faces\":{},\"instances\":{},\"skipped_small\":{},\"skipped_heavy\":{},\"simplified\":{}}}",
+            r.con_geometria, totali, r.triangoli_origine, unici, r.nodi, r.non_supportati, r.facce_illeggibili, r.istanze, r.scartati_piccoli, r.scartati_pesanti, r.semplificati
+        ),
+    )
 }
 
 /// Scrive due cubi colorati in STEP e in IGES, li rilegge e controlla il risultato.

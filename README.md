@@ -26,6 +26,13 @@ Opzioni per i file grandi (usate da robo importer 0.7):
 - `--soften GRADI`: scrive anche le **linee morbide** (`src/spigoli.rs`): per ogni triangolo, quali lati stanno fra due facce
   che piegano meno di GRADI. I punti uguali (entro 0,001 mm) si uniscono con una griglia che guarda anche le 26 celle vicine.
   Il file esce nella versione 4 del formato (`src/rstp.rs`). 343.000 triangoli in 0,05 s.
+- `--estimate L,A,L,A,...` (con `--preview`, STEP e IGES; robo importer 0.8): quanti triangoli darebbe ogni dettaglio, nel
+  resoconto `estimate` = [nel modello, da costruire, 1 = triangolato davvero / 0 = stimato]. Bozza e (se Bozza costruisce meno
+  di 300.000 triangoli) Normale si triangolano per intero; Alta si stima da un campione di pezzi presi dal piu' piccolo (al
+  massimo 100.000 triangoli o 10 s), con una retta logaritmica del rapporto in funzione della grandezza del pezzo. Su un assieme
+  reale di 18,6 MB: Bozza e Normale esatti, Alta 3,6 milioni stimati contro 14,7 reali (i pezzi grandi e curvi crescono di piu').
+- `--info-file FILE` (robo importer 0.9): il resoconto JSON si scrive anche in questo file. Il programma senza finestra
+  lanciato da SketchUp non porta la sua uscita standard nel file che il plugin gli da', quindi il plugin legge questo.
 - Il motore lavora a **priorita' sotto la normale** e lascia libero un processore (i suoi fili di lavoro e quelli di
   OpenCascade), cosi' il computer resta usabile mentre legge.
 
@@ -46,7 +53,7 @@ Servono Rust (target `x86_64-pc-windows-msvc`), gli strumenti C++ di Visual Stud
 
 2. `cargo build --release` (se OpenCascade è altrove: variabile `OCCT_ROOT`).
 3. `cargo test --release`: prova STEP e IGES con due cubi colorati (nomi, colori, posizioni, volumi, orientamento).
-4. Copia `target/release/robo_stp_engine_silent.exe` in `robo_importer/bin/` del repository dei plugin.
+4. Copia `target/release/robo_stp_engine_silent.exe` in `installer/engine/` del repository dei plugin: l'installatore di robo importer lo mette in `%LOCALAPPDATA%\RoboTools\robo_importer\bin`. Chi vuole puo' sostituire quel file con il motore ricompilato da se'.
 
 ## File 3ds Max (.max)
 
@@ -72,14 +79,18 @@ normali in f32 (metri) e le lunghezze dei triangle strip. Risultato: una sola pa
 - Non si leggono colori, assiemi (`.sldasm`), solidi importati da STEP dentro SolidWorks, ne' i file anteriori al 2015 (contenitore OLE).
 - Provato su un solo file reale (`SS CHAIR.SLDPRT`, 174 facce, 66.828 triangoli, letto in 60 ms).
 
-## Licenza
-
-OpenCascade è distribuito con licenza LGPL 2.1 con l'eccezione OCCT. Il collegamento è statico: chi distribuisce il
-programma deve rispettare le condizioni della LGPL (indicare l'uso di OpenCascade e permettere di sostituirlo).
-Va verificato con attenzione prima di una distribuzione pubblica.
-
 ## Limiti
 
-- Provato con file generati da OpenCascade stesso; **non** ancora con file reali di programmi CAD (SolidWorks,
-  Fusion, FreeCAD…), che possono avere assiemi grandi, superfici complesse o unità diverse.
+- Provato con file generati da OpenCascade stesso e con alcuni assiemi STEP reali (fino a 18,6 MB, 234 parti); ogni nuovo
+  programma CAD puo' avere assiemi grandi, superfici complesse o unita' diverse.
 - IGES conserva meno dei STEP: nomi e assiemi spesso si perdono.
+
+## Licenza
+
+Il motore e' distribuito con la **GNU Lesser General Public License 2.1 con l'eccezione Open CASCADE 1.0** (file `LICENSE` e
+`OCCT-EXCEPTION.txt`), la stessa di OpenCascade, che e' collegato staticamente: chiunque puo' modificare il motore,
+ricompilarlo (anche con una versione modificata di OpenCascade, vedi *Compilare*) e usarlo al posto di quello installato.
+
+Open Cascade Technology 7.9.3 (c) Open CASCADE SAS, sorgente non modificato: https://github.com/Open-Cascade-SAS/OCCT/releases/tag/V7_9_3
+
+Le librerie Rust incluse (tutte con licenza MIT) sono elencate, con le righe di copyright, in `THIRD-PARTY.txt`.

@@ -4,6 +4,13 @@
 use robo_stp_engine::ffi::{carica, scrivi_cubi_di_prova, Formato, Parte};
 use robo_stp_engine::rstp;
 
+/// OpenCascade ha impostazioni globali (per esempio l'unita' di lettura): i test che lo usano passano uno alla volta.
+static OCCT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn in_fila() -> std::sync::MutexGuard<'static, ()> {
+    OCCT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn limiti(parti: &[Parte]) -> ([f32; 3], [f32; 3]) {
     let mut min = [f32::MAX; 3];
     let mut max = [f32::MIN; 3];
@@ -44,6 +51,7 @@ fn prova(formato: Formato, estensione: &str) -> Vec<Parte> {
 
 #[test]
 fn step_assieme_con_nomi_colori_e_posizioni() {
+    let _fila = in_fila();
     let parti = prova(Formato::Step, "stp");
     assert_eq!(parti.len(), 2);
     let rosso = parti.iter().find(|p| p.nome == "Assieme/CuboRosso").expect("nome del pezzo");
@@ -61,6 +69,7 @@ fn step_assieme_con_nomi_colori_e_posizioni() {
 
 #[test]
 fn iges_stessa_geometria() {
+    let _fila = in_fila();
     let parti = prova(Formato::Iges, "igs");
     assert!(!parti.is_empty());
     let (min, max) = limiti(&parti);
@@ -72,12 +81,14 @@ fn iges_stessa_geometria() {
 
 #[test]
 fn il_formato_di_scambio_conserva_tutto() {
+    let _fila = in_fila();
     let parti = prova(Formato::Step, "step");
     assert_eq!(rstp::leggi(&rstp::scrivi(&parti)).unwrap(), parti);
 }
 
 #[test]
 fn pezzi_ripetuti_come_definizione_e_istanze() {
+    let _fila = in_fila();
     use robo_stp_engine::ffi::{carica_voci, scrivi_cubi_ripetuti};
     use robo_stp_engine::rstp::Voce;
     let dir = std::env::temp_dir().join("robo_stp_test_ripetuti");
@@ -88,7 +99,7 @@ fn pezzi_ripetuti_come_definizione_e_istanze() {
     let parti = carica(&file, 0.1, 0.5).unwrap();
     assert_eq!(parti.len(), 3);
     // con le istanze: il rosso e' una definizione (nelle sue coordinate) con due istanze, il blu resta una parte
-    let (voci, _) = carica_voci(&file, 0.1, 0.5, None, true).unwrap();
+    let voci = carica_voci(&file, 0.1, 0.5, None, true, &[]).unwrap().voci;
     std::fs::remove_dir_all(&dir).ok();
     let definizioni: Vec<_> = voci.iter().filter_map(|v| if let Voce::Definizione(id, p) = v { Some((*id, p)) } else { None }).collect();
     assert_eq!(definizioni.len(), 1);
@@ -107,6 +118,7 @@ fn pezzi_ripetuti_come_definizione_e_istanze() {
 
 #[test]
 fn il_tetto_dei_triangoli_allarga_la_tolleranza() {
+    let _fila = in_fila();
     use robo_stp_engine::ffi::carica_voci;
     use robo_stp_engine::rstp::Voce;
     // due cubi: 24 triangoli in tutto, qualunque tolleranza; il tetto non puo' scendere sotto, ma non deve rompere nulla
@@ -114,7 +126,8 @@ fn il_tetto_dei_triangoli_allarga_la_tolleranza() {
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("tetto.stp");
     scrivi_cubi_di_prova(&file, Formato::Step).unwrap();
-    let (voci, usata) = carica_voci(&file, 0.1, 0.5, Some(10), false).unwrap();
+    let letto = carica_voci(&file, 0.1, 0.5, Some(10), false, &[]).unwrap();
+    let (voci, usata) = (letto.voci, letto.tolleranza);
     std::fs::remove_dir_all(&dir).ok();
     let triangoli: usize = voci.iter().map(|v| if let Voce::Geometria(p) = v { p.triangoli.len() / 3 } else { 0 }).sum();
     assert_eq!(triangoli, 24);
@@ -122,7 +135,27 @@ fn il_tetto_dei_triangoli_allarga_la_tolleranza() {
 }
 
 #[test]
+fn le_stime_dei_dettagli_contano_i_triangoli() {
+    let _fila = in_fila();
+    use robo_stp_engine::ffi::{carica_voci, scrivi_cubi_ripetuti};
+    let dir = std::env::temp_dir().join("robo_stp_test_stime");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("stime.stp");
+    scrivi_cubi_ripetuti(&file, Formato::Step).unwrap();
+    // tre cubi (il rosso due volte): 36 triangoli nel modello, 24 da costruire, a qualunque dettaglio (sono piani)
+    let letto = carica_voci(&file, 5.0, 1.5, None, false, &[(0.5, 0.8), (0.1, 0.5), (0.02, 0.3)]).unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(letto.stime.len(), 3);
+    // Bozza e Normale triangolate per intero, Alta stimata dal campione (qui il rapporto e' 1: i cubi sono piani)
+    let conti: Vec<_> = letto.stime.iter().map(|s| (s.nel_modello, s.da_costruire, s.misurata)).collect();
+    assert_eq!(conti, vec![(36, 24, true), (36, 24, true), (36, 24, false)]);
+    // dopo le stime l'anteprima resta quella grossolana chiesta
+    assert_eq!(letto.tolleranza, 5.0);
+}
+
+#[test]
 fn errori_chiari() {
+    let _fila = in_fila();
     let dir = std::env::temp_dir().join("robo_stp_test_errori");
     std::fs::create_dir_all(&dir).unwrap();
     let rovinato = dir.join("rovinato.stp");

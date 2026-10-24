@@ -1,0 +1,46 @@
+robo_stp_engine - third-party Rust components / componenti Rust di terzi
+=========================================================================
+
+The engine (robo_stp_engine.exe, robo_stp_engine_silent.exe) contains code from the Rust crates below. Where a crate
+offers a choice of licenses ("MIT OR Apache-2.0" and similar), it is used here under the MIT license. Open CASCADE
+Technology, also linked into the engine, is covered by its own license (see LICENSE and OCCT-EXCEPTION.txt).
+
+Il motore contiene codice delle librerie (crate) Rust qui sotto. Quando una libreria lascia scegliere fra piu' licenze,
+qui e' usata con la licenza MIT. Open CASCADE Technology, anch'essa collegata nel motore, ha la sua licenza (vedi LICENSE e
+OCCT-EXCEPTION.txt).
+
+Crate            Version   License used   Copyright                                                        Source
+---------------  --------  -------------  ---------------------------------------------------------------  ------------------------------------------------
+adler2           2.0.1     MIT            Copyright (C) Jonas Schievink                                    https://github.com/oyvindln/adler2
+anyhow           1.0.104   MIT            Copyright (c) David Tolnay                                       https://github.com/dtolnay/anyhow
+cfb              0.15.0    MIT            Copyright (c) 2017 Matthew D. Steele                             https://github.com/mdsteele/rust-cfb
+cfg-if           1.0.5     MIT            Copyright (c) 2014 Alex Crichton                                 https://github.com/rust-lang/cfg-if
+crc32fast        1.5.2     MIT            Copyright (c) 2018 Sam Rijs, Alex Crichton and contributors      https://github.com/srijs/rust-crc32fast
+flate2           1.1.10    MIT            Copyright (c) 2014-2026 Alex Crichton                            https://github.com/rust-lang/flate2-rs
+fnv              1.0.7     MIT            Copyright (c) 2017 Contributors                                  https://github.com/servo/rust-fnv
+miniz_oxide      0.9.1     MIT            Copyright (c) 2017 Frommi; Copyright (c) 2017-2024 oyvindln;     https://github.com/Frommi/miniz_oxide
+                                          Copyright 2010-2014 Rich Geldreich and Tenacious Software LLC;
+                                          Copyright 2013-2014 RAD Game Tools and Valve Software
+simd-adler32     0.3.10    MIT            Copyright (c) 2021 Marvin Countryman                             https://github.com/mcountryman/simd-adler32
+uuid             1.28.0    MIT            Copyright (c) 2014 The Rust Project Developers;                  https://github.com/uuid-rs/uuid
+                                          Copyright (c) 2018 Ashley Mannix, Christopher Armstrong,
+                                          Dylan DPC, Hunar Roop Kahlon
+web-time         1.1.0     MIT            Copyright (c) 2023 dAxpeDDa                                      https://github.com/daxpedda/web-time
+
+The MIT License applies to each of the crates above, with its own copyright line:
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+  documentation files (the "Software"), to deal in the Software without restriction, including without limitation the
+  rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit
+  persons to whom the Software is furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all copies or substantial portions of the
+  Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+  WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+  COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+  OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+The list comes from `cargo tree -e normal --target x86_64-pc-windows-msvc` (the crates that end up in the Windows
+program); the full license files of every crate are in its source package on crates.io.

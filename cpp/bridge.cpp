@@ -27,7 +27,9 @@
 #include <TDF_Tool.hxx>
 #include <TDataStd_Name.hxx>
 #include <TDocStd_Document.hxx>
+#include <TopExp.hxx>
 #include <TopExp_Explorer.hxx>
+#include <TopTools_IndexedMapOfShape.hxx>
 #include <TopLoc_Location.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Face.hxx>
@@ -41,6 +43,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -255,16 +258,25 @@ uint64_t triangles_of(const TopoDS_Shape& shape) {
 
 // Triangola ogni pezzo una volta e conta i triangoli che arriveranno a SketchUp: con le istanze un pezzo ripetuto si
 // costruisce una volta sola.
-uint64_t mesh_all(Ctx& c) {
-  uint64_t total = 0;
+uint64_t mesh_all(Ctx& c, uint64_t* in_model = nullptr, uint64_t* to_build = nullptr) {
+  uint64_t all = 0, once = 0;
   for (size_t i = 0; i < c.unique_shapes.size(); ++i) {
     const TopoDS_Shape& s = c.unique_shapes[i];
     if (s.IsNull()) continue;
     BRepMesh_IncrementalMesh mesher(s, c.lin, Standard_False, c.ang, Standard_True);
     const uint64_t n = triangles_of(s);
-    total += c.instances ? n : n * static_cast<uint64_t>(c.uses[c.unique_entries[i]]);
+    once += n;
+    all += n * static_cast<uint64_t>(c.uses[c.unique_entries[i]]);
   }
-  return total;
+  if (in_model) *in_model = all;
+  if (to_build) *to_build = once;
+  return c.instances ? once : all;
+}
+
+// Toglie le triangolazioni: la prossima si fa da capo con la tolleranza nuova (una triangolazione piu' fine verrebbe tenuta).
+void clean_all(Ctx& c) {
+  for (const TopoDS_Shape& s : c.unique_shapes)
+    if (!s.IsNull()) BRepTools::Clean(s);
 }
 
 // Oltre il tetto: la tolleranza si allarga in proporzione ai triangoli in piu' (piu' o meno inversa al loro numero) e si
@@ -276,10 +288,134 @@ void fit_to(Ctx& c, uint64_t max_triangles) {
     const double f = static_cast<double>(total) / static_cast<double>(max_triangles);
     c.lin *= f * 1.15;
     c.ang = std::min(c.ang * std::sqrt(f), 1.2);
-    for (const TopoDS_Shape& s : c.unique_shapes)
-      if (!s.IsNull()) BRepTools::Clean(s);
+    clean_all(c);
     total = mesh_all(c);
   }
+}
+
+// Per l'anteprima: quanti triangoli darebbe ogni dettaglio (coppie tolleranza, angolo, dalla piu' grossolana alla piu' fine).
+// I primi FULL_LEVELS dettagli si triangolano per intero, se quello prima ha dato meno di MEASURE_LIMIT triangoli da costruire.
+// Gli altri si stimano da un campione: alcuni pezzi sparsi nel modello si triangolano con il dettaglio di prima e con questo, e
+// il rapporto fra i due si applica al totale (un dettaglio fine con l'angolo stretto moltiplica i triangoli dei raccordi piccoli
+// in un modo che nessuna curva dai dettagli grossolani prevede). Per ogni dettaglio: nel modello, da costruire, 1 se triangolato
+// per intero, 0 se stimato.
+const uint64_t MEASURE_LIMIT = 300000;
+const int FULL_LEVELS = 2;
+const uint64_t SAMPLE_BUDGET = 100000;  // triangoli del campione al dettaglio piu' fine: l'anteprima resta veloce
+const size_t SAMPLE_PIECES = 40;
+const double SAMPLE_SECONDS = 10.0;  // e comunque non piu' di questo tempo
+
+uint64_t mesh_one(const TopoDS_Shape& s, double lin, double ang) {
+  BRepTools::Clean(s);
+  BRepMesh_IncrementalMesh mesher(s, lin, Standard_False, ang, Standard_True);
+  return triangles_of(s);
+}
+
+// I triangoli che darebbe un dettaglio, stimati da un campione. I pezzi del campione si prendono dal piu' piccolo al piu' grande,
+// sparsi su tutte le grandezze: un pezzo enorme, che al dettaglio fine puo' chiedere minuti, arriva per ultimo e il campione si
+// ferma prima (tetto di triangoli e di tempo). Per i pezzi del campione si conosce il rapporto fra i triangoli nuovi e quelli
+// che hanno adesso (la triangolazione del dettaglio prima); il rapporto cresce con la grandezza del pezzo (le superfici grandi e
+// curve si infittiscono di piu'), quindi si cerca la retta log(rapporto) = a + b log(triangoli) e la si usa per ogni pezzo non
+// misurato, secondo la sua grandezza. Nel modello ogni pezzo pesa per le volte che compare; da costruire, una volta.
+void sample_level(Ctx& c, double lin1, double ang1, double& in_model, double& to_build) {
+  const size_t n = c.unique_shapes.size();
+  std::vector<std::pair<uint64_t, size_t>> sizes;
+  std::vector<uint64_t> now(n, 0), after(n, 0);
+  std::vector<bool> measured(n, false);
+  for (size_t i = 0; i < n; ++i) {
+    if (c.unique_shapes[i].IsNull()) continue;
+    now[i] = triangles_of(c.unique_shapes[i]);
+    sizes.emplace_back(now[i], i);
+  }
+  std::sort(sizes.begin(), sizes.end());
+  const size_t picks = std::min(SAMPLE_PIECES, sizes.size());
+  const auto start = std::chrono::steady_clock::now();
+  std::vector<double> xs, ys;
+  uint64_t spent = 0;
+  for (size_t k = 0; k < picks && spent < SAMPLE_BUDGET; ++k) {
+    if (std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() > SAMPLE_SECONDS) break;
+    const size_t i = sizes[k * sizes.size() / picks].second;
+    if (now[i] == 0 || measured[i]) continue;
+    after[i] = mesh_one(c.unique_shapes[i], lin1, ang1);
+    measured[i] = true;
+    spent += after[i];
+    if (after[i] > 0) {
+      xs.push_back(std::log(static_cast<double>(now[i])));
+      ys.push_back(std::log(static_cast<double>(after[i]) / static_cast<double>(now[i])));
+    }
+  }
+  // la retta dei minimi quadrati; con pochi punti, o tutti della stessa grandezza, il rapporto medio
+  double a = 0.0, b = 0.0;
+  const size_t m = xs.size();
+  if (m > 0) {
+    double sx = 0, sy = 0, sxx = 0, sxy = 0;
+    for (size_t k = 0; k < m; ++k) {
+      sx += xs[k];
+      sy += ys[k];
+      sxx += xs[k] * xs[k];
+      sxy += xs[k] * ys[k];
+    }
+    const double den = m * sxx - sx * sx;
+    if (m >= 3 && den > 1e-9) b = std::max(-0.5, std::min(1.0, (m * sxy - sx * sy) / den));
+    a = (sy - b * sx) / m;
+  }
+  in_model = 0;
+  to_build = 0;
+  for (size_t i = 0; i < n; ++i) {
+    if (c.unique_shapes[i].IsNull()) continue;
+    double t = static_cast<double>(after[i]);
+    if (!measured[i] && now[i] > 0) {
+      const double ratio = std::exp(a + b * std::log(static_cast<double>(now[i])));
+      t = static_cast<double>(now[i]) * std::max(0.5, std::min(100.0, ratio));
+    }
+    in_model += t * static_cast<double>(c.uses[c.unique_entries[i]]);
+    to_build += t;
+  }
+}
+
+void estimate(Ctx& c, int n, const double* params, uint64_t* out) {
+  const double keep_lin = c.lin, keep_ang = c.ang;
+  double model = 0, build = 0;
+  bool full = true;
+  for (int i = 0; i < n; ++i) {
+    const double lin = params[2 * i], ang = params[2 * i + 1];
+    full = full && i < FULL_LEVELS && (i == 0 || build < static_cast<double>(MEASURE_LIMIT));
+    if (full) {
+      uint64_t m = 0, u = 0;
+      clean_all(c);
+      c.lin = lin;
+      c.ang = ang;
+      mesh_all(c, &m, &u);
+      model = static_cast<double>(m);
+      build = static_cast<double>(u);
+    } else {
+      sample_level(c, lin, ang, model, build);
+    }
+    out[3 * i] = static_cast<uint64_t>(model);
+    out[3 * i + 1] = static_cast<uint64_t>(build);
+    out[3 * i + 2] = full ? 1 : 0;
+  }
+  clean_all(c);
+  c.lin = keep_lin;
+  c.ang = keep_ang;
+}
+
+// Le facce (superfici) e i bordi (curve) del file stesso, prima di ogni triangolazione: nel modello ogni pezzo conta per le
+// volte che compare. In `out`: facce, bordi.
+void count_source(Ctx& c, uint64_t* out) {
+  uint64_t faces = 0, edges = 0;
+  for (size_t i = 0; i < c.unique_shapes.size(); ++i) {
+    const TopoDS_Shape& s = c.unique_shapes[i];
+    if (s.IsNull()) continue;
+    TopTools_IndexedMapOfShape f, e;
+    TopExp::MapShapes(s, TopAbs_FACE, f);
+    TopExp::MapShapes(s, TopAbs_EDGE, e);
+    const uint64_t uses = static_cast<uint64_t>(c.uses[c.unique_entries[i]]);
+    faces += static_cast<uint64_t>(f.Extent()) * uses;
+    edges += static_cast<uint64_t>(e.Extent()) * uses;
+  }
+  out[0] = faces;
+  out[1] = edges;
 }
 
 // OpenCascade triangola in parallelo: si lascia libero un processore, cosi' il computer resta usabile.
@@ -325,8 +461,9 @@ extern "C" {
 
 const char* rstp_occt_version(void) { return OCC_VERSION_STRING_EXT; }
 
-int rstp_load(const char* path, int format, double lin, double ang, uint64_t max_triangles, int instances, rstp_item_cb cb,
-              void* user, double* used_linear, char* err, uint32_t err_len) {
+int rstp_load(const char* path, int format, double lin, double ang, uint64_t max_triangles, int instances, int n_estimates,
+              const double* estimate_params, uint64_t* estimate_out, rstp_item_cb cb, void* user, double* used_linear,
+              uint64_t* source_counts, char* err, uint32_t err_len) {
   try {
     limit_threads();
     Interface_Static::SetCVal("xstep.cascade.unit", "MM");
@@ -372,6 +509,8 @@ int rstp_load(const char* path, int format, double lin, double ang, uint64_t max
       return 4;
     }
     for (Standard_Integer i = 1; i <= roots.Length(); ++i) count(c, roots.Value(i), 0);
+    if (source_counts) count_source(c, source_counts);
+    if (n_estimates > 0 && estimate_params && estimate_out) estimate(c, n_estimates, estimate_params, estimate_out);
     fit_to(c, max_triangles);
     if (used_linear) *used_linear = c.lin;
     for (Standard_Integer i = 1; i <= roots.Length(); ++i) visit(c, roots.Value(i), TopLoc_Location(), std::string(), 0);

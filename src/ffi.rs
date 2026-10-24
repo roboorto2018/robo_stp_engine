@@ -16,9 +16,13 @@ extern "C" {
         angular: f64,
         max_triangles: u64,
         instances: i32,
+        n_estimates: i32,
+        estimate_params: *const f64,
+        estimate_out: *mut u64,
         cb: RaccogliVoce,
         user: *mut c_void,
         used_linear: *mut f64,
+        source_counts: *mut u64,
         err: *mut c_char,
         err_len: u32,
     ) -> i32;
@@ -126,14 +130,38 @@ fn c_path(p: &Path) -> Result<CString> {
 /// Legge un file STEP o IGES: ogni pezzo nella sua posizione finale. `lineare` e' la tolleranza della triangolazione in mm,
 /// `angolare` in radianti.
 pub fn carica(percorso: &Path, lineare: f64, angolare: f64) -> Result<Vec<Parte>> {
-    let (voci, _) = carica_voci(percorso, lineare, angolare, None, false)?;
-    Ok(voci.into_iter().filter_map(|v| if let Voce::Geometria(p) = v { Some(p) } else { None }).collect())
+    let letto = carica_voci(percorso, lineare, angolare, None, false, &[])?;
+    Ok(letto.voci.into_iter().filter_map(|v| if let Voce::Geometria(p) = v { Some(p) } else { None }).collect())
+}
+
+/// Quanti triangoli darebbe un dettaglio (per l'anteprima).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stima {
+    /// nel modello: ogni copia di un pezzo ripetuto conta
+    pub nel_modello: u64,
+    /// da costruire: un pezzo ripetuto conta una volta (diventa un componente)
+    pub da_costruire: u64,
+    /// true: triangolato davvero; false: stimato dalla curva dei dettagli misurati
+    pub misurata: bool,
+}
+
+/// Quello che restituisce la lettura di un file STEP o IGES.
+pub struct Letto {
+    pub voci: Vec<Voce>,
+    /// la tolleranza usata davvero (piu' larga di quella chiesta se c'era un tetto)
+    pub tolleranza: f64,
+    /// una per ogni dettaglio chiesto in `stime`
+    pub stime: Vec<Stima>,
+    /// le facce (superfici) del file, prima della triangolazione; ogni copia di un pezzo ripetuto conta
+    pub facce_file: u64,
+    /// i bordi (curve) del file, contati allo stesso modo
+    pub bordi_file: u64,
 }
 
 /// Legge un file STEP o IGES con le scelte del plugin: `tetto` = al massimo questi triangoli (la tolleranza si allarga finche'
-/// ci si sta); `istanze` = i pezzi ripetuti arrivano come una definizione e le sue istanze. Restituisce le voci e la tolleranza
-/// usata davvero.
-pub fn carica_voci(percorso: &Path, lineare: f64, angolare: f64, tetto: Option<usize>, istanze: bool) -> Result<(Vec<Voce>, f64)> {
+/// ci si sta); `istanze` = i pezzi ripetuti arrivano come una definizione e le sue istanze; `stime` = coppie (tolleranza mm,
+/// angolo rad), dalla piu' grossolana alla piu' fine, di cui contare i triangoli.
+pub fn carica_voci(percorso: &Path, lineare: f64, angolare: f64, tetto: Option<usize>, istanze: bool, stime: &[(f64, f64)]) -> Result<Letto> {
     let formato = Formato::da_percorso(percorso)?;
     if !percorso.is_file() {
         bail!("file non trovato: {}", percorso.display());
@@ -141,8 +169,11 @@ pub fn carica_voci(percorso: &Path, lineare: f64, angolare: f64, tetto: Option<u
     let path = c_path(percorso)?;
     let mut voci: Vec<Voce> = Vec::new();
     let mut usata = lineare;
+    let parametri: Vec<f64> = stime.iter().flat_map(|&(l, a)| [l, a]).collect();
+    let mut conteggi = vec![0u64; 3 * stime.len()];
+    let mut sorgente = [0u64; 2];
     let mut err = vec![0u8; 512];
-    // SAFETY: tutti i puntatori restano validi durante la chiamata.
+    // SAFETY: tutti i puntatori restano validi durante la chiamata; `conteggi` ha tre posti per ogni stima chiesta.
     let codice = unsafe {
         rstp_load(
             path.as_ptr(),
@@ -151,9 +182,13 @@ pub fn carica_voci(percorso: &Path, lineare: f64, angolare: f64, tetto: Option<u
             angolare,
             tetto.unwrap_or(0) as u64,
             i32::from(istanze),
+            stime.len() as i32,
+            parametri.as_ptr(),
+            conteggi.as_mut_ptr(),
             raccogli,
             &mut voci as *mut _ as *mut c_void,
             &mut usata,
+            sorgente.as_mut_ptr(),
             err.as_mut_ptr() as *mut c_char,
             err.len() as u32,
         )
@@ -161,7 +196,8 @@ pub fn carica_voci(percorso: &Path, lineare: f64, angolare: f64, tetto: Option<u
     if codice != 0 {
         bail!("{}", messaggio(&err));
     }
-    Ok((voci, usata))
+    let stime = conteggi.chunks(3).map(|c| Stima { nel_modello: c[0], da_costruire: c[1], misurata: c[2] == 1 }).collect();
+    Ok(Letto { voci, tolleranza: usata, stime, facce_file: sorgente[0], bordi_file: sorgente[1] })
 }
 
 /// Scrive un file di prova (due cubi colorati in un assieme).
