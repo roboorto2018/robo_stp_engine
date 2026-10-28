@@ -4,7 +4,9 @@
 //! E' un contenitore OLE (CFB) con uno stream «Scene» fatto di blocchi (id u16, lunghezza u32 o u64, bit alto = contiene altri blocchi).
 //! Si leggono: nomi e gerarchia dei nodi, posizione/rotazione/scala (controller fissi), offset dell'oggetto,
 //! e la geometria degli oggetti **Editable Mesh** e **Editable Poly** (anche sotto una pila di modificatori: si prende
-//! l'oggetto di base, i modificatori non vengono applicati). Spline, forme, luci, camere e texture non si importano; dei materiali si legge solo il colore diffuso dei materiali V-Ray (uno per oggetto).
+//! l'oggetto di base, i modificatori non vengono applicati). Spline, forme, luci e camere non si importano. Dei materiali si
+//! leggono il colore diffuso (V-Ray, Corona, Standard, Corona Light; gli altri tramite i materiali che contengono) e la prima
+//! immagine; un Multi/Sub-Object divide l'oggetto secondo l'ID del materiale di ogni faccia.
 
 use crate::ffi::{Parte, Texture};
 use crate::rstp::Voce;
@@ -106,6 +108,14 @@ const CL_MESH: (u32, u32) = (0xe44f_10b3, 0);
 const CL_POLY: (u32, u32) = (0x1bf8_338d, 0x192f_6098);
 const CL_NODO: (u32, u32) = (1, 0);
 const CL_VRAY: (u32, u32) = (0x37bf_3f2f, 0x7034_695c);
+const CL_MULTI: (u32, u32) = (0x200, 0);
+const CL_STANDARD: (u32, u32) = (0x2, 0);
+/// CoronaMtl (anche «CoronaLegacyMtl» nelle versioni recenti di Corona: stessa classe)
+const CL_CORONA: (u32, u32) = (0x70be_6506, 0x4489_31dd);
+const CL_CORONA_LUCE: (u32, u32) = (0x53b7_717a, 0x500d_5093);
+const SUPER_MATERIALE: u32 = 0xc00;
+const SUPER_PARAMBLOCK2: u32 = 0x82;
+const SUPER_SHADER: u32 = 0x10b0;
 const CL_DERIVATO: u16 = 0x2032; // «oggetto derivato»: pila di modificatori con l'oggetto di base per ultimo
 
 /// Matrice 4x3 con i vettori riga come in 3ds Max: p' = p * M.
@@ -192,6 +202,8 @@ struct Geometria {
     triangoli: Vec<[u32; 3]>,
     /// Coordinate di mappatura (u, v) dei tre angoli di ogni triangolo, se sono state chieste e il file le ha.
     uv: Option<Vec<[[f32; 2]; 3]>>,
+    /// L'ID del materiale di ogni triangolo (quello della sua faccia, da 0): sceglie il sotto-materiale di un Multi/Sub-Object.
+    materiali: Option<Vec<u16>>,
 }
 
 /// Cosa e' successo nella lettura.
@@ -385,23 +397,91 @@ impl FileMax {
         None
     }
 
-    /// Il colore del materiale assegnato a un nodo (nel riferimento 3): quello «diffuso» del primo materiale V-Ray che si trova,
-    /// anche dentro Multi/Sub-Object, Double Sided e simili (di un Multi/Sub-Object si usa il primo sotto-materiale).
-    /// I materiali Standard e le texture non si leggono: in quel caso None.
-    fn colore_nodo(&self, nodo: &Nodo) -> Option<[f32; 4]> {
-        let mut coda = vec![(*nodo.riferimenti.get(&3)?, 0usize)];
+    /// Il materiale assegnato a un nodo (nel riferimento 3), se c'e'.
+    fn materiale_nodo(&self, nodo: &Nodo) -> Option<usize> {
+        nodo.riferimenti.get(&3).copied().filter(|&p| p < self.blocchi.len())
+    }
+
+    fn superclasse(&self, pos: usize) -> Option<u32> {
+        let id = self.blocchi.get(pos)?.id as usize;
+        self.classi.get(id).map(|c| c.superclasse)
+    }
+
+    /// Il colore «diffuso» di un materiale: V-Ray, Corona (anche Legacy), Standard (dal suo shader, Blinn, Phong...) e Corona
+    /// Light (il colore della luce); per gli altri (Multi/Sub-Object, Double Sided, Blend, Layered, VRay2Sided...) quello del
+    /// primo materiale che contengono. Le texture non danno un colore: un materiale fatto solo di immagini resta senza.
+    fn colore_materiale(&self, inizio: usize) -> Option<[f32; 4]> {
+        let mut coda = std::collections::VecDeque::from([(inizio, 0usize)]);
         let mut visti = HashSet::new();
-        while !coda.is_empty() {
-            let (pos, livello) = coda.remove(0);
+        while let Some((pos, livello)) = coda.pop_front() {
             if pos >= self.blocchi.len() || !visti.insert(pos) {
                 continue;
             }
-            if self.classe(pos) == Some(CL_VRAY) {
-                return self.diffuso_vray(pos);
+            match self.classe(pos) {
+                Some(CL_VRAY) => return self.diffuso_vray(pos),
+                Some(CL_CORONA) => return self.colore_nei_blocchi(pos, Some(101)),
+                Some(CL_CORONA_LUCE) => return self.colore_nei_blocchi(pos, None),
+                Some(CL_STANDARD) => {
+                    let shader = self.riferimenti_slot(pos).into_iter().find(|&r| self.superclasse(r) == Some(SUPER_SHADER));
+                    return shader.and_then(|s| self.colore_nei_blocchi(s, Some(1)));
+                }
+                _ => {}
             }
             if livello < 4 {
                 for r in self.riferimenti_slot(pos) {
-                    coda.push((r, livello + 1));
+                    coda.push_back((r, livello + 1));
+                }
+            }
+        }
+        None
+    }
+
+    /// I sotto-materiali di un Multi/Sub-Object con il loro ID (da 0, come gli ID delle facce), dal suo ParamBlock2: il
+    /// parametro 0 e' l'elenco dei materiali, il 3 quello degli ID. Se non si leggono: i materiali nell'ordine dei riferimenti,
+    /// con ID 0, 1, 2...
+    fn sotto_materiali(&self, pos: usize) -> Vec<(u16, usize)> {
+        let rif = self.riferimenti_slot(pos);
+        let materiale = |r: usize| r < self.blocchi.len() && self.superclasse(r) == Some(SUPER_MATERIALE);
+        if let Some(pb) = rif.iter().copied().find(|&r| self.superclasse(r) == Some(SUPER_PARAMBLOCK2)) {
+            if let (Some(m), Some(id)) = (self.elenco_param(pb, 0), self.elenco_param(pb, 3)) {
+                if m.len() == id.len() && !m.is_empty() {
+                    return id.iter().zip(&m).filter(|(_, &r)| materiale(r as usize)).map(|(&i, &r)| (i as u16, r as usize)).collect();
+                }
+            }
+        }
+        rif.into_iter().filter(|&r| materiale(r)).enumerate().map(|(i, r)| (i as u16, r)).collect()
+    }
+
+    /// Un parametro di un ParamBlock2: id (u16), tipo (u16), 11 byte di intestazione, poi i valori.
+    fn parametro(&self, pb: usize, id: u16) -> Option<Blocco> {
+        let b = &self.scena;
+        figli(b, self.blocchi.get(pb)?).into_iter().find(|e| (e.id == 0x100e || e.id == 0x000e) && e.e - e.s >= 4 && u16::from_le_bytes([b[e.s], b[e.s + 1]]) == id)
+    }
+
+    /// Un parametro «elenco» (Tab): il numero delle voci, poi per ognuna 1 byte e un valore di 4 byte (un intero, o il numero di
+    /// un riferimento).
+    fn elenco_param(&self, pb: usize, id: u16) -> Option<Vec<u32>> {
+        let b = &self.scena;
+        let e = self.parametro(pb, id)?;
+        if e.e - e.s < 19 {
+            return None;
+        }
+        let n = u32_at(b, e.s + 15) as usize;
+        if n > 10_000 || e.e - e.s < 19 + n * 5 {
+            return None;
+        }
+        Some((0..n).map(|k| u32_at(b, e.s + 20 + k * 5)).collect())
+    }
+
+    /// Un colore (parametro di tipo 2: 3 numeri decimali) nei ParamBlock2 di un materiale: quello con l'id dato, o il primo.
+    fn colore_nei_blocchi(&self, pos: usize, id: Option<u16>) -> Option<[f32; 4]> {
+        let b = &self.scena;
+        for pb in self.riferimenti_slot(pos).into_iter().filter(|&r| self.superclasse(r) == Some(SUPER_PARAMBLOCK2)) {
+            for e in figli(b, &self.blocchi[pb]) {
+                let pid = |e: &Blocco| u16::from_le_bytes([b[e.s], b[e.s + 1]]);
+                if (e.id == 0x100e || e.id == 0x000e) && e.e - e.s >= 27 && u16::from_le_bytes([b[e.s + 2], b[e.s + 3]]) == 2 && id.is_none_or(|i| pid(&e) == i) {
+                    let c = |i: usize| f32_at(b, e.s + 15 + i * 4).clamp(0.0, 1.0);
+                    return Some([c(0), c(1), c(2), 1.0]);
                 }
             }
         }
@@ -436,13 +516,13 @@ impl FileMax {
         None
     }
 
-    /// L'immagine (texture) del materiale di un nodo: la prima immagine che si trova scendendo nel materiale,
-    /// anche dentro Multi/Sub-Object e simili. Il percorso e' quello salvato nel file .max.
-    fn immagine_nodo(&self, nodo: &Nodo) -> Option<String> {
+    /// L'immagine (texture) di un materiale: la prima immagine che si trova scendendo nel materiale (anche dentro Double
+    /// Sided e simili). Il percorso e' quello salvato nel file .max.
+    fn immagine_materiale(&self, inizio: usize) -> Option<String> {
         if self.immagini.is_empty() {
             return None;
         }
-        let mut coda = vec![(*nodo.riferimenti.get(&3)?, 0usize)];
+        let mut coda = vec![(inizio, 0usize)];
         let mut visti = HashSet::new();
         while !coda.is_empty() {
             let (pos, livello) = coda.remove(0);
@@ -542,19 +622,22 @@ impl FileMax {
         let vertici = (0..nv).map(|i| [f32_at(b, v.s + 4 + i * 12), f32_at(b, v.s + 8 + i * 12), f32_at(b, v.s + 12 + i * 12)]).collect();
         let mappa = if con_uv { self.uv_mesh(&m) } else { None };
         let mut triangoli = Vec::with_capacity(nf);
+        let mut materiali = Vec::with_capacity(nf);
         let mut uv: Option<Vec<[[f32; 2]; 3]>> = mappa.as_ref().map(|_| Vec::with_capacity(nf));
         for i in 0..nf {
+            // v0 v1 v2, gruppi di smussatura, flags (l'ID del materiale nei 16 bit alti)
             let p = f.s + 4 + i * 20;
             let t = [u32_at(b, p), u32_at(b, p + 4), u32_at(b, p + 8)];
             if t.iter().all(|&x| (x as usize) < nv) {
                 triangoli.push(t);
+                materiali.push((u32_at(b, p + 16) >> 16) as u16);
                 if let (Some((punti, facce)), Some(u)) = (&mappa, uv.as_mut()) {
                     let angolo = |k: usize| facce.get(i).and_then(|tf| punti.get(tf[k] as usize)).copied().unwrap_or([0.0, 0.0]);
                     u.push([angolo(0), angolo(1), angolo(2)]);
                 }
             }
         }
-        Some(Geometria { vertici, triangoli, uv })
+        Some(Geometria { vertici, triangoli, uv, materiali: Some(materiali) })
     }
 
     /// Editable Poly: (geometria, true se le facce sono state lette tutte).
@@ -583,13 +666,15 @@ impl FileMax {
                 p += 12;
             }
         }
-        let (facce, ok) = leggi_facce(&b[f.s..f.e], nv)?;
+        let (facce, ok, id_facce) = leggi_facce(&b[f.s..f.e], nv)?;
         let mappa = if con_uv { self.uv_poly(&m).filter(|(_, tf)| tf.len() == facce.len()) } else { None };
         let mut triangoli = Vec::new();
+        let mut materiali = Vec::new();
         let mut uv: Option<Vec<[[f32; 2]; 3]>> = mappa.as_ref().map(|_| Vec::new());
         for (i, fc) in facce.iter().enumerate() {
             let prima = triangoli.len();
             triangola(fc, &vertici, &mut triangoli);
+            materiali.resize(triangoli.len(), id_facce[i]);
             if let (Some((punti, tf)), Some(u)) = (&mappa, uv.as_mut()) {
                 // l'angolo di un triangolo e' un vertice della faccia: la sua coordinata e' quella allo stesso posto nella faccia delle coordinate
                 let angolo = |v: u32| fc.iter().position(|&x| x == v).and_then(|k| tf[i].get(k)).and_then(|&c| punti.get(c as usize)).copied().unwrap_or([0.0, 0.0]);
@@ -598,7 +683,7 @@ impl FileMax {
                 }
             }
         }
-        Some((Geometria { vertici, triangoli, uv }, ok))
+        Some((Geometria { vertici, triangoli, uv, materiali: Some(materiali) }, ok))
     }
 
     /// Legge il file e restituisce le voci (in millimetri) e il resoconto.
@@ -751,31 +836,40 @@ impl FileMax {
             }
             (vertici, g.triangoli.iter().flatten().copied().collect())
         };
-        // l'immagine e la mappatura di un oggetto: solo se la geometria ha le coordinate e il materiale ha un'immagine
-        let texture_di = |pos: usize, g: &Geometria| -> Option<Texture> {
+        // l'immagine e la mappatura di un pezzo: solo se la geometria ha le coordinate e il materiale ha un'immagine
+        let texture_di = |materiale: Option<usize>, g: &Geometria| -> Option<Texture> {
             let uv = g.uv.as_ref()?;
             if uv.len() != g.triangoli.len() {
                 return None;
             }
-            let file = nodi.get(&pos).and_then(|n| self.immagine_nodo(n))?;
+            let file = self.immagine_materiale(materiale?)?;
             Some(texture_da_angoli(file, g, uv))
         };
         let mut voci = Vec::new();
-        let mut definite: HashMap<usize, u32> = HashMap::new();
+        // una definizione per ogni oggetto ripetuto con lo stesso materiale (le copie con un altro materiale ne hanno un'altra)
+        let mut definite: HashMap<(usize, Option<usize>), u32> = HashMap::new();
         let mut colori: HashMap<usize, Option<[f32; 4]>> = HashMap::new();
-        let mut colore_di = |pos: usize| *colori.entry(pos).or_insert_with(|| nodi.get(&pos).and_then(|n| self.colore_nodo(n)));
+        let mut colore_di = |materiale: Option<usize>| materiale.and_then(|m| *colori.entry(m).or_insert_with(|| self.colore_materiale(m)));
+        let mut sotto: HashMap<usize, Vec<(u16, usize)>> = HashMap::new();
         for u in &usi {
             let Some(Some((g, _))) = cache.get(&u.base) else { continue };
             let nome = percorso_nome(u.pos, &nodi);
+            let materiale = nodi.get(&u.pos).and_then(|n| self.materiale_nodo(n));
+            // un Multi/Sub-Object: un pezzo per ogni sotto-materiale usato dalle facce (stesso nome: in SketchUp lo stesso gruppo)
+            let pezzi = self.pezzi(materiale, g, &mut sotto);
             if o.istanze && volte[&u.base] > 1 {
-                let id = match definite.get(&u.base) {
+                let chiave = (u.base, materiale);
+                let id = match definite.get(&chiave) {
                     Some(&id) => id,
                     None => {
                         let id = definite.len() as u32;
-                        let (vertici, triangoli) = in_mm(g, None);
-                        let colore = colore_di(u.pos);
-                        voci.push(Voce::Definizione(id, Parte { nome: nome.clone(), colore, vertici, triangoli, texture: texture_di(u.pos, g) }));
-                        definite.insert(u.base, id);
+                        for (m, tri) in &pezzi {
+                            let parte = tri.as_ref().map(|t| sottoinsieme(g, t));
+                            let gp = parte.as_ref().unwrap_or(g);
+                            let (vertici, triangoli) = in_mm(gp, None);
+                            voci.push(Voce::Definizione(id, Parte { nome: nome.clone(), colore: colore_di(*m), vertici, triangoli, texture: texture_di(*m, gp) }));
+                        }
+                        definite.insert(chiave, id);
                         id
                     }
                 };
@@ -797,13 +891,48 @@ impl FileMax {
                 voci.push(Voce::Istanza { definizione: id, nome, matrice });
                 res.istanze += 1;
             } else {
-                let (vertici, triangoli) = in_mm(g, Some(&u.m));
-                let colore = colore_di(u.pos);
-                voci.push(Voce::Geometria(Parte { nome, colore, vertici, triangoli, texture: texture_di(u.pos, g) }));
+                for (m, tri) in &pezzi {
+                    let parte = tri.as_ref().map(|t| sottoinsieme(g, t));
+                    let gp = parte.as_ref().unwrap_or(g);
+                    let (vertici, triangoli) = in_mm(gp, Some(&u.m));
+                    voci.push(Voce::Geometria(Parte { nome: nome.clone(), colore: colore_di(*m), vertici, triangoli, texture: texture_di(*m, gp) }));
+                }
             }
             res.con_geometria += 1;
         }
         (voci, res)
+    }
+
+    /// Come si divide un oggetto secondo il suo materiale: [(materiale, triangoli)], con None = tutti i triangoli. Un
+    /// Multi/Sub-Object da' un pezzo per ogni sotto-materiale usato dalle facce (l'ID di una faccia che non c'e' nell'elenco
+    /// prende il sotto-materiale ID modulo il loro numero, come fa 3ds Max); ogni altro materiale, un pezzo solo.
+    fn pezzi(&self, materiale: Option<usize>, g: &Geometria, sotto: &mut HashMap<usize, Vec<(u16, usize)>>) -> Vec<(Option<usize>, Option<Vec<usize>>)> {
+        let intero = vec![(materiale, None)];
+        let (Some(m), Some(id)) = (materiale, g.materiali.as_ref()) else { return intero };
+        if self.classe(m) != Some(CL_MULTI) || id.len() != g.triangoli.len() {
+            return intero;
+        }
+        let elenco = sotto.entry(m).or_insert_with(|| self.sotto_materiali(m));
+        if elenco.is_empty() {
+            return intero;
+        }
+        let per_id: HashMap<u16, usize> = elenco.iter().map(|&(i, r)| (i, r)).collect();
+        let mut ordine: Vec<(Option<usize>, Option<Vec<usize>>)> = Vec::new();
+        let mut dove: HashMap<usize, usize> = HashMap::new();
+        for (t, &i) in id.iter().enumerate() {
+            let r = per_id.get(&i).copied().unwrap_or_else(|| elenco[i as usize % elenco.len()].1);
+            let k = *dove.entry(r).or_insert_with(|| {
+                ordine.push((Some(r), Some(Vec::new())));
+                ordine.len() - 1
+            });
+            if let Some(v) = ordine[k].1.as_mut() {
+                v.push(t);
+            }
+        }
+        if ordine.len() == 1 {
+            return vec![(ordine[0].0, None)];
+        }
+        ordine
     }
 
     fn matrice_mondo(&self, pos: usize, nodi: &HashMap<usize, Nodo>, memo: &mut HashMap<usize, Mat>) -> Mat {
@@ -857,6 +986,29 @@ fn leggi_immagini(d: &[u8]) -> Vec<([u8; 16], String)> {
     v
 }
 
+/// I triangoli scelti di una geometria, con solo i vertici che usano (e le loro coordinate di mappatura e materiali).
+fn sottoinsieme(g: &Geometria, scelti: &[usize]) -> Geometria {
+    let mut nuovo = vec![u32::MAX; g.vertici.len()];
+    let mut vertici = Vec::new();
+    let mut triangoli = Vec::with_capacity(scelti.len());
+    for &t in scelti {
+        let tr = g.triangoli[t];
+        let mut n = [0u32; 3];
+        for k in 0..3 {
+            let v = tr[k] as usize;
+            if nuovo[v] == u32::MAX {
+                nuovo[v] = vertici.len() as u32;
+                vertici.push(g.vertici[v]);
+            }
+            n[k] = nuovo[v];
+        }
+        triangoli.push(n);
+    }
+    let uv = g.uv.as_ref().map(|u| scelti.iter().map(|&t| u[t]).collect());
+    let materiali = g.materiali.as_ref().map(|m| scelti.iter().map(|&t| m[t]).collect());
+    Geometria { vertici, triangoli, uv, materiali }
+}
+
 /// Dalle coordinate dei tre angoli di ogni triangolo: una coordinata per vertice, e i triangoli che toccano un vertice
 /// con coordinate diverse da un triangolo all'altro (bordi della mappatura), con le loro coordinate.
 fn texture_da_angoli(file: String, g: &Geometria, uv: &[[[f32; 2]; 3]]) -> Texture {
@@ -906,7 +1058,8 @@ fn percorso_nome(pos: usize, nodi: &HashMap<usize, Nodo>) -> String {
 /// Le facce di un Editable Poly: ognuna e' «gradi, indici, flags» seguita da una coda la cui lunghezza dipende dai flags e dai gradi.
 /// La coda e' cercata cosi': prima la lunghezza prevista, poi le vicine; vale la prima per cui anche la faccia dopo ha senso
 /// (indici dentro l'elenco dei vertici) e il conteggio finale torna.
-fn leggi_facce(d: &[u8], nv: usize) -> Option<(Vec<Vec<u32>>, bool)> {
+/// Restituisce le facce, true se lette tutte, e l'ID del materiale di ogni faccia.
+fn leggi_facce(d: &[u8], nv: usize) -> Option<(Vec<Vec<u32>>, bool, Vec<u16>)> {
     if d.len() < 4 {
         return None;
     }
@@ -1006,7 +1159,22 @@ fn leggi_facce(d: &[u8], nv: usize) -> Option<(Vec<Vec<u32>>, bool)> {
         }
     }
     let facce = pila.iter().map(|f| (0..f.g).map(|j| u32_at(d, f.p + 4 + 4 * j)).collect()).collect();
-    Some((facce, true))
+    let materiali = pila.iter().map(|f| materiale_faccia(d, f.p, f.g)).collect();
+    Some((facce, true, materiali))
+}
+
+/// L'ID del materiale di una faccia di un Editable Poly: nella coda, dopo i gruppi di smussatura (flag 0x1, 4 byte), se c'e'
+/// (flag 0x8, 2 byte); senza, e' 0.
+fn materiale_faccia(d: &[u8], p: usize, g: usize) -> u16 {
+    let fl = u32_at(d, p + 4 + 4 * g);
+    if fl & 0x8 == 0 {
+        return 0;
+    }
+    let q = p + 8 + 4 * g + if fl & 0x1 != 0 { 4 } else { 0 };
+    if q + 2 > d.len() {
+        return 0;
+    }
+    u16::from_le_bytes([d[q], d[q + 1]])
 }
 
 /// Lunghezza prevista (byte) della coda di una faccia, dai flags e dai gradi.
@@ -1153,6 +1321,7 @@ pub fn semplifica_parti(parti: &mut [Parte], totale: usize) {
         let p = &lette[i];
         let g = Geometria {
             uv: None,
+            materiali: None,
             vertici: (0..p.vertici.len() / 3).map(|k| [p.vertici[3 * k], p.vertici[3 * k + 1], p.vertici[3 * k + 2]]).collect(),
             triangoli: (0..p.triangoli.len() / 3).map(|k| [p.triangoli[3 * k], p.triangoli[3 * k + 1], p.triangoli[3 * k + 2]]).collect(),
         };
@@ -1287,7 +1456,7 @@ type MappaVeloce<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<HashVeloce>
 /// (la media); la griglia si infittisce o si allarga fino a stare sotto `obiettivo` triangoli. Veloce, ma perde i dettagli piccoli.
 fn semplifica(g: &Geometria, obiettivo: usize) -> Geometria {
     if g.triangoli.len() <= obiettivo {
-        return Geometria { vertici: g.vertici.clone(), triangoli: g.triangoli.clone(), uv: g.uv.clone() };
+        return Geometria { vertici: g.vertici.clone(), triangoli: g.triangoli.clone(), uv: g.uv.clone(), materiali: g.materiali.clone() };
     }
     let (mut mn, mut mx) = ([f32::MAX; 3], [f32::MIN; 3]);
     for t in &g.triangoli {
@@ -1355,7 +1524,9 @@ fn semplifica(g: &Geometria, obiettivo: usize) -> Geometria {
         .collect();
     let mut visti: std::collections::HashSet<[u32; 3], std::hash::BuildHasherDefault<HashVeloce>> = Default::default();
     let mut triangoli = Vec::new();
-    for t in &g.triangoli {
+    // ogni triangolo che resta tiene il materiale del triangolo da cui viene
+    let mut materiali = g.materiali.as_ref().map(|_| Vec::new());
+    for (i, t) in g.triangoli.iter().enumerate() {
         let (a, b, k) = (di_vertice[t[0] as usize], di_vertice[t[1] as usize], di_vertice[t[2] as usize]);
         if a == b || b == k || a == k {
             continue;
@@ -1364,9 +1535,12 @@ fn semplifica(g: &Geometria, obiettivo: usize) -> Geometria {
         chiave.sort_unstable();
         if visti.insert(chiave) {
             triangoli.push([a, b, k]);
+            if let (Some(m), Some(da)) = (materiali.as_mut(), g.materiali.as_ref()) {
+                m.push(da.get(i).copied().unwrap_or(0));
+            }
         }
     }
-    Geometria { vertici, triangoli, uv: None }
+    Geometria { vertici, triangoli, uv: None, materiali }
 }
 
 #[cfg(test)]
@@ -1589,6 +1763,20 @@ mod test {
     }
 
     #[test]
+    fn un_sottoinsieme_tiene_solo_i_suoi_vertici() {
+        let g = Geometria {
+            vertici: vec![[0.0; 3], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0], [5.0, 5.0, 5.0]],
+            triangoli: vec![[0, 1, 2], [0, 2, 3]],
+            uv: None,
+            materiali: Some(vec![0, 1]),
+        };
+        let s = sottoinsieme(&g, &[1]);
+        assert_eq!(s.triangoli, vec![[0, 1, 2]]);
+        assert_eq!(s.vertici, vec![[0.0; 3], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]]);
+        assert_eq!(s.materiali, Some(vec![1]));
+    }
+
+    #[test]
     fn la_semplificazione_riduce_i_triangoli() {
         // una griglia di 40 x 40 quadrati = 3200 triangoli
         let n = 41usize;
@@ -1607,8 +1795,10 @@ mod test {
                 triangoli.push([a, d, c]);
             }
         }
-        let g = Geometria { vertici, triangoli, uv: None };
+        let materiali = Some((0..triangoli.len()).map(|i| (i % 2) as u16).collect());
+        let g = Geometria { vertici, triangoli, uv: None, materiali };
         let s = semplifica(&g, 800);
+        assert_eq!(s.materiali.as_ref().map(Vec::len), Some(s.triangoli.len()));
         assert!(s.triangoli.len() <= 800 && s.triangoli.len() > 100, "{} triangoli", s.triangoli.len());
         assert!(s.triangoli.iter().flatten().all(|&i| (i as usize) < s.vertici.len()));
         // sotto l'obiettivo: resta com'e'
