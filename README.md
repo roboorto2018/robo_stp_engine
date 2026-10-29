@@ -1,7 +1,7 @@
 # robo_stp_engine
 
 Il motore di **robo importer** (plugin di SketchUp): legge file **STEP** e **IGES** con
-[OpenCascade](https://dev.opencascade.org/) (OCCT 7.9.3) e scrive i triangoli, con nomi, colori e posizioni
+[OpenCascade](https://dev.opencascade.org/) (OCCT 7.9.3), file **FBX, glTF/GLB, OBJ, 3MF e PLY** con [Assimp](https://github.com/assimp/assimp) (6.0.2) e scrive i triangoli, con nomi, colori e posizioni
 dell'assieme, in un piccolo formato binario (`.rstp`, vedi `src/rstp.rs`).
 
 Rust fa da regista: argomenti, formato di uscita, errori. OpenCascade è chiamato tramite un ponte C
@@ -51,8 +51,22 @@ Servono Rust (target `x86_64-pc-windows-msvc`), gli strumenti C++ di Visual Stud
    cmake --build build --config Release --target install --parallel 16
    ```
 
-2. `cargo build --release` (se OpenCascade è altrove: variabile `OCCT_ROOT`).
-3. `cargo test --release`: prova STEP e IGES con due cubi colorati (nomi, colori, posizioni, volumi, orientamento).
+   Compila Assimp come libreria statica con i soli lettori FBX, glTF, OBJ, 3MF e PLY (una volta sola, pochi minuti; lo script e' `assimp_build.sh`, da lanciare in `C:/assimp`):
+
+   ```
+   git clone --depth 1 --branch v6.0.2 https://github.com/assimp/assimp.git src
+   cmake -S src -B build -G "Visual Studio 18 2026" -A x64 -DBUILD_SHARED_LIBS=OFF ^
+     -DASSIMP_BUILD_ALL_IMPORTERS_BY_DEFAULT=OFF -DASSIMP_BUILD_FBX_IMPORTER=ON -DASSIMP_BUILD_GLTF_IMPORTER=ON ^
+     -DASSIMP_BUILD_OBJ_IMPORTER=ON -DASSIMP_BUILD_3MF_IMPORTER=ON -DASSIMP_BUILD_PLY_IMPORTER=ON -DASSIMP_NO_EXPORT=ON ^
+     -DASSIMP_BUILD_ALL_EXPORTERS_BY_DEFAULT=OFF -DASSIMP_BUILD_TESTS=OFF -DASSIMP_BUILD_ASSIMP_TOOLS=OFF -DASSIMP_BUILD_ZLIB=ON ^
+     -DCMAKE_INSTALL_PREFIX=C:/assimp/install
+   cmake --build build --config Release --target install --parallel 16
+   ```
+
+2. `cargo build --release` (se OpenCascade o Assimp sono altrove: variabili `OCCT_ROOT` e `ASSIMP_ROOT`).
+3. `cargo test --release`: prova STEP e IGES con due cubi colorati (nomi, colori, posizioni, volumi, orientamento); `tests/assimp.rs` prova
+   i file FBX, glTF/GLB, OBJ, 3MF e PLY sui modelli di prova del sorgente di Assimp (`C:/assimp/src/test/models`, variabile
+   `ASSIMP_MODELS`; senza la cartella le prove non fanno niente).
 4. Copia `target/release/robo_stp_engine_silent.exe` in `installer/engine/` del repository dei plugin: l'installatore di robo importer lo mette in `%LOCALAPPDATA%\RoboTools\robo_importer\bin`. Chi vuole puo' sostituire quel file con il motore ricompilato da se'.
 
 ## File 3ds Max (.max)
@@ -94,3 +108,38 @@ ricompilarlo (anche con una versione modificata di OpenCascade, vedi *Compilare*
 Open Cascade Technology 7.9.3 (c) Open CASCADE SAS, sorgente non modificato: https://github.com/Open-Cascade-SAS/OCCT/releases/tag/V7_9_3
 
 Le librerie Rust incluse (tutte con licenza MIT) sono elencate, con le righe di copyright, in `THIRD-PARTY.txt`.
+
+## File FBX, glTF/GLB, OBJ, 3MF e PLY
+
+`robo_stp_engine --input FILE.fbx|.gltf|.glb|.obj|.3mf|.ply --output FILE.rstp [--unit mm|cm|m|in|ft] [--axes 0|1] [--instances 1] [--uv 1] [--texture-dir CARTELLA]`
+legge questi formati con **Assimp** (`cpp/assimp_bridge.cpp`, `src/assimp.rs`): FBX binario o ASCII (FBX 2011 e successivi), glTF 2.0
+(.gltf con i suoi .bin e immagini, o .glb), OBJ con il suo .mtl, 3MF, PLY di testo o binario. Quello che cambia da un formato all'altro e'
+solo unita' e assi:
+
+| Formato | Unita' | Assi (`--axes`, predefinito) |
+| --- | --- | --- |
+| FBX | scritta nel file (`UnitScaleFactor`) | scritti nel file (`UpAxis`, `FrontAxis`, `CoordAxis`) → Z in alto (1) |
+| glTF / GLB | sempre metri | sempre Y in alto → Z in alto (1) |
+| OBJ | non scritta: `--unit`, predefinito metri | non scritti: di solito Y in alto → Z in alto (1) |
+| 3MF | scritta nel modello (`unit`, letta da `src/assimp.rs` dentro lo ZIP) | Z in alto: come sono (0) |
+| PLY | non scritta: `--unit`, predefinito millimetri | non scritti: come sono (0) |
+
+
+- Si leggono le **mesh dei nodi** (triangolate da Assimp), con i nomi dei nodi come percorso dei gruppi ("Padre/Figlio"); un nodo con piu'
+  mesh (una per materiale) le mette in sottogruppi. Animazioni, ossa, luci e camere non si importano: le mesh arrivano nella posa del file.
+- **Unita'**: quella del file o del formato (tabella), oppure quella di `--unit`; il resoconto la dice in `file_unit`
+  (`file_unit_written`: true se e' scritta nel file).
+- **Assi**: con `--axes 1` gli assi del file (FBX: `UpAxis`, `FrontAxis`, `CoordAxis` con i loro segni; se il file non li dice: Y in
+  alto) diventano quelli di SketchUp, Z in alto; con `--axes 0` le coordinate restano come sono.
+- **Mesh ripetute**: con `--instances 1` una mesh usata da piu' nodi arriva come una definizione e le sue istanze.
+- **Materiali**: colore diffuso (o base color dei materiali PBR, glTF) e opacita'; senza colore ma con i colori nei vertici (scansioni PLY) la
+  loro media; con `--uv 1` anche la prima immagine (diffusa o base color) e la mappatura. Le immagini **incorporate** nel file si scrivono in `--texture-dir` (predefinito: accanto a `--output`, cartella `.textures`);
+  quelle esterne si cercano dove dice il file, poi accanto al file FBX.
+- I punti nella stessa posizione (Assimp li divide ai bordi della mappatura) tornano uno solo; i triangoli ai bordi della mappatura portano le
+  loro coordinate, come per i file .max. Una posizione specchiata gira i triangoli, che restano con la faccia verso l'esterno.
+- Con `--max-triangles` o `--preview` le mesh piu' pesanti si semplificano (e perdono la mappatura).
+- Non si leggono: i file con soli punti o linee (nuvole di punti), i glTF compressi con Draco; i messaggi lo dicono in chiaro.
+- Provato sui modelli di prova di Assimp: FBX 16 su 17 (uno e' rotto anche per Assimp); glTF, GLB, OBJ, 3MF e PLY 60 su 88, gli altri sono
+  file rotti apposta, nuvole di punti o glTF con Draco. Unita' (mm, cm, m e 5 m), assi Y in alto, copie specchiate, immagini incorporate
+  (FBX e GLB), pezzi ripetuti come istanze (100 nel motore a due cilindri glTF), materiali PBR.
+- Licenze di Assimp e delle librerie che contiene: `THIRD-PARTY-ASSIMP.txt`.

@@ -2,15 +2,16 @@
 // Usato da robo importer (plugin di SketchUp); non apre finestre e non usa la rete.
 
 use anyhow::{bail, Context, Result};
-use robo_stp_engine::{ffi, maxfile, rstp, sldprt};
+use robo_stp_engine::{assimp, ffi, maxfile, rstp, sldprt};
 use std::path::PathBuf;
 
 const AIUTO: &str = "\
-robo_stp_engine - STEP/IGES con OpenCascade
+robo_stp_engine - STEP/IGES con OpenCascade; FBX, glTF/GLB, OBJ, 3MF e PLY con Assimp
 
-  robo_stp_engine --input FILE.stp|.step|.igs|.iges|.max|.sldprt --output FILE.rstp
+  robo_stp_engine --input FILE.stp|.step|.igs|.iges|.max|.sldprt|.fbx|.gltf|.glb|.obj|.3mf|.ply --output FILE.rstp
                   [--deflection MM] [--angle RADIANTI] [--error-file FILE] [--info-file FILE]
                   [--unit mm|cm|m|in|ft] [--uv 1] [--min-size MM] [--skip-heavy N]   (solo .max)
+                  [--unit ...] [--uv 1] [--axes 0|1] [--texture-dir CARTELLA]          (.fbx .gltf .glb .obj .3mf .ply)
                   [--instances 1] [--max-triangles N] [--soften GRADI]
   robo_stp_engine --selftest      prova STEP e IGES con due cubi colorati
   robo_stp_engine --sample FILE   scrive un file di esempio (.stp o .igs) con due cubi colorati
@@ -18,10 +19,13 @@ robo_stp_engine - STEP/IGES con OpenCascade
 
 --deflection  tolleranza della triangolazione in mm (predefinito 0.1; piu' piccola = piu' triangoli)
 --angle       deviazione angolare in radianti (predefinito 0.5)
---unit        solo per i file .max: unita' del file (predefinito mm)
---instances   1 = gli oggetti ripetuti diventano istanze di una definizione (.max, STEP, IGES)
---uv          .max: 1 = legge anche le immagini dei materiali e la mappatura (UV)
---max-triangles al massimo questo totale di triangoli: .max e .sldprt semplificano gli oggetti piu' pesanti, STEP e IGES
+--unit        .max: unita' del file (predefinito mm); .fbx .gltf .glb .3mf: al posto di quella del file; .obj .ply: l'unita' (predefinito m, mm)
+--axes        1 = gli assi del file (FBX: UpAxis...; glTF, OBJ e senza indicazioni: Y in alto) diventano quelli di SketchUp, Z in alto
+              (predefinito per .fbx .gltf .glb .obj); 0 = come sono (predefinito per .3mf .ply)
+--texture-dir .fbx .glb .gltf: dove scrivere le immagini incorporate nel file (predefinito: accanto a --output)
+--instances   1 = gli oggetti ripetuti diventano istanze di una definizione (.max, .fbx, .gltf, .glb, .3mf, STEP, IGES)
+--uv          .max .fbx .gltf .glb .obj: 1 = legge anche le immagini dei materiali e la mappatura (UV)
+--max-triangles al massimo questo totale di triangoli: .max, .sldprt e i formati di Assimp semplificano gli oggetti piu' pesanti, STEP e IGES
               allargano la tolleranza della triangolazione
 --soften      scrive anche le linee morbide (lati fra facce che piegano meno di GRADI): formato RSTP versione 4
 --min-size    .max: ignora gli oggetti piu' piccoli di cosi' (mm, lato maggiore)
@@ -45,13 +49,20 @@ struct Opzioni {
     stime: Vec<(f64, f64)>,
     /// Dove scrivere anche il resoconto (una riga JSON).
     info: Option<PathBuf>,
+    /// formati di Assimp: millimetri per unita' scelti con --unit (None: quelli del file o del formato), assi del file (None: quelli
+    /// del formato), cartella delle immagini incorporate
+    unita_scelta: Option<f64>,
+    assi: Option<bool>,
+    cartella_texture: PathBuf,
 }
 
 fn leggi_argomenti(args: &[String]) -> Result<Opzioni> {
     let mut input = None;
     let mut output = None;
     let (mut deflection, mut angle) = (0.1_f64, 0.5_f64);
-    let mut unit = "mm".to_string();
+    let mut unit: Option<String> = None;
+    let mut assi = None;
+    let mut cartella_texture = None;
     let (mut istanze, mut max_triangoli, mut dim_minima, mut oggetto_max) = (false, None, None, None);
     let mut anteprima = None;
     let mut morbidi = None;
@@ -66,7 +77,9 @@ fn leggi_argomenti(args: &[String]) -> Result<Opzioni> {
             "--output" => output = Some(PathBuf::from(valore(i)?)),
             "--deflection" => deflection = valore(i)?.replace(',', ".").parse().context("--deflection non e' un numero")?,
             "--angle" => angle = valore(i)?.replace(',', ".").parse().context("--angle non e' un numero")?,
-            "--unit" => unit = valore(i)?.clone(),
+            "--unit" => unit = Some(valore(i)?.clone()),
+            "--axes" => assi = Some(valore(i)? != "0"),
+            "--texture-dir" => cartella_texture = Some(PathBuf::from(valore(i)?)),
             "--preview" => anteprima = Some(valore(i)?.parse::<usize>().context("--preview non e' un numero intero")?.max(1000)),
             "--instances" => istanze = valore(i)? == "1",
             "--uv" => uv = valore(i)? == "1",
@@ -93,7 +106,8 @@ fn leggi_argomenti(args: &[String]) -> Result<Opzioni> {
     if !(angle > 0.0 && angle <= 3.2) {
         bail!("--angle deve essere tra 0 e 3.2 radianti");
     }
-    let mut max = maxfile::OpzioniMax::semplici(maxfile::mm_per_unita(&unit)?);
+    let unita_scelta = unit.as_deref().map(maxfile::mm_per_unita).transpose()?;
+    let mut max = maxfile::OpzioniMax::semplici(unita_scelta.unwrap_or(1.0));
     max.istanze = istanze;
     max.uv = uv;
     max.max_triangoli = max_triangoli.filter(|&n| n > 0);
@@ -111,7 +125,9 @@ fn leggi_argomenti(args: &[String]) -> Result<Opzioni> {
         angle = angle.max(1.5);
         morbidi = None;
     }
-    Ok(Opzioni { input: input.context("manca --input")?, output: output.context("manca --output")?, deflection, angle, max, anteprima, morbidi, stime, info })
+    let output: PathBuf = output.context("manca --output")?;
+    let cartella_texture = cartella_texture.unwrap_or_else(|| output.with_extension("textures"));
+    Ok(Opzioni { input: input.context("manca --input")?, output, deflection, angle, max, anteprima, morbidi, stime, info, unita_scelta, assi, cartella_texture })
 }
 
 /// Le voci nel formato chiesto: con le linee morbide (versione 4) o come prima.
@@ -149,6 +165,9 @@ fn conta(voci: &[rstp::Voce]) -> (usize, usize) {
 fn converti(o: &Opzioni) -> Result<()> {
     if o.input.extension().is_some_and(|e| e.eq_ignore_ascii_case("max")) {
         return converti_max(o);
+    }
+    if let Some(formato) = assimp::Formato::da_percorso(&o.input) {
+        return converti_assimp(o, formato);
     }
     // SolidWorks (.sldprt): si legge la mesh di visualizzazione salvata nel file; gli altri formati vanno a OpenCascade, che
     // con un tetto ai triangoli allarga da se' la tolleranza (l'anteprima invece taglia le parti piu' pesanti, piu' sotto)
@@ -224,6 +243,89 @@ fn converti_max(o: &Opzioni) -> Result<()> {
     )
 }
 
+/// File FBX, glTF/GLB, OBJ, 3MF e PLY (Assimp): le mesh dei nodi, con unita' e assi del file, del formato o scelti, colori,
+/// immagini e mesh ripetute come istanze.
+fn converti_assimp(o: &Opzioni, formato: assimp::Formato) -> Result<()> {
+    // l'unita' quando il file non la dice: quella del formato; un 3MF la scrive nel modello
+    let mut predefinita = formato.unita_predefinita_mm();
+    let mut dal_file = false;
+    if formato == assimp::Formato::Treemmf {
+        if let Some(mm) = assimp::unita_3mf(&o.input) {
+            predefinita = mm;
+            dal_file = true;
+        }
+    }
+    let scelte = assimp::OpzioniAssimp {
+        unita_mm: o.unita_scelta,
+        unita_predefinita_mm: predefinita,
+        assi_del_file: o.assi.unwrap_or_else(|| formato.assi_predefiniti()),
+        istanze: o.max.istanze,
+        uv: o.max.uv,
+        cartella_texture: o.cartella_texture.clone(),
+    };
+    let (mut voci, mut info) = assimp::carica(&o.input, &scelte)?;
+    info.unita_dal_file |= dal_file;
+    if voci.is_empty() {
+        bail!(
+            "il file non ha prodotto nessuna mesh da importare ({} mesh, {} nodi con mesh; i punti e le linee senza facce non si importano)",
+            info.mesh,
+            info.nodi
+        );
+    }
+    let (origine, _) = conta(&voci);
+    // anteprima, o limite di triangoli scelto con il dettaglio: si semplificano le mesh piu' pesanti
+    let semplificate = o.anteprima.or(o.max.max_triangoli).map_or(0, |n| semplifica_voci(&mut voci, n));
+    scrivi(o, &voci)?;
+    let (triangoli, unici) = conta(&voci);
+    let istanze = voci.iter().filter(|v| matches!(v, rstp::Voce::Istanza { .. })).count();
+    resoconto(
+        o,
+        &format!(
+            "{{\"parts\":{},\"triangles\":{},\"unique_triangles\":{},\"source_triangles\":{},\"instances\":{},\"meshes\":{},\"nodes\":{},\"simplified\":{},\"file_unit\":\"{}\",\"file_unit_mm\":{},\"file_unit_written\":{},\"up_axis\":{},\"embedded_textures\":{},\"assimp\":\"{}\"}}",
+            voci.len() - istanze,
+            triangoli,
+            unici,
+            origine,
+            istanze,
+            info.mesh,
+            info.nodi,
+            semplificate,
+            info.nome_unita(),
+            info.unita_file_mm,
+            info.unita_dal_file,
+            info.asse_alto,
+            info.incorporate,
+            assimp::versione_assimp()
+        ),
+    )
+}
+
+/// Al massimo `n` triangoli da costruire: le mesh piu' pesanti (geometrie e definizioni) si semplificano; una mesh semplificata
+/// perde la mappatura (i suoi punti non sono piu' quelli delle coordinate). Restituisce quante.
+fn semplifica_voci(voci: &mut [rstp::Voce], n: usize) -> usize {
+    let mut posti = Vec::new();
+    let mut parti = Vec::new();
+    for (i, v) in voci.iter_mut().enumerate() {
+        if let rstp::Voce::Geometria(p) | rstp::Voce::Definizione(_, p) = v {
+            posti.push(i);
+            parti.push(std::mem::replace(p, ffi::Parte { nome: String::new(), colore: None, vertici: Vec::new(), triangoli: Vec::new(), texture: None }));
+        }
+    }
+    let prima: Vec<usize> = parti.iter().map(|p| p.triangoli.len()).collect();
+    maxfile::semplifica_parti(&mut parti, n);
+    let mut cambiate = 0;
+    for ((i, mut p), prima) in posti.into_iter().zip(parti).zip(prima) {
+        if p.triangoli.len() != prima {
+            p.texture = None;
+            cambiate += 1;
+        }
+        if let rstp::Voce::Geometria(q) | rstp::Voce::Definizione(_, q) = &mut voci[i] {
+            *q = p;
+        }
+    }
+    cambiate
+}
+
 /// Scrive due cubi colorati in STEP e in IGES, li rilegge e controlla il risultato.
 fn autoprova() -> Result<()> {
     let dir = std::env::temp_dir().join("robo_stp_selftest");
@@ -290,7 +392,7 @@ fn main() {
             Ok(())
         }
         Some("--version") => {
-            println!("robo_stp_engine {} (OpenCascade {})", env!("CARGO_PKG_VERSION"), ffi::versione_occt());
+            println!("robo_stp_engine {} (OpenCascade {}, Assimp {})", env!("CARGO_PKG_VERSION"), ffi::versione_occt(), assimp::versione_assimp());
             Ok(())
         }
         Some("--selftest") => autoprova(),
