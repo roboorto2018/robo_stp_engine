@@ -3,9 +3,11 @@
 # The Windows engine is built on Windows as before (README); this file changes nothing there.
 name: macOS engine
 
+# On main, only when the engine itself changes (Rust, C++ bridge, build), or started by hand (Actions > macOS engine > Run).
 on:
   push:
-    branches: [mac-build]
+    branches: [main]
+    paths: ['src/**', 'cpp/**', 'build.rs', 'Cargo.toml', 'Cargo.lock', 'ci/**', '.github/workflows/macos.yml']
   workflow_dispatch:
 
 jobs:
