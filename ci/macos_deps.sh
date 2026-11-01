@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # OpenCascade 7.9.3 and Assimp 6.0.2 as universal (arm64 + x86_64) static libraries for macOS, the same options as the
 # Windows builds (C:/occt/build.sh, assimp_build.sh). Runs on the macOS runner of GitHub Actions (.github/workflows/macos.yml).
-# Result: $DEPS/occt (include/opencascade, lib/libTK*.a) and $DEPS/assimp (include, lib/libassimp.a, libzlibstatic.a).
+# Result: $DEPS/occt (include/opencascade, lib/libTK*.a) and $DEPS/assimp (include, lib/libassimp.a). zlib: the one of macOS
+# (the copy inside Assimp does not compile with the SDK of Xcode 16).
 set -euo pipefail
 DEPS="${DEPS:-$HOME/deps}"
 ARCHS="arm64;x86_64"
@@ -31,7 +32,7 @@ cmake -S assimp -B assimp-build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECT
   -DASSIMP_BUILD_OBJ_IMPORTER=ON -DASSIMP_BUILD_3MF_IMPORTER=ON -DASSIMP_BUILD_PLY_IMPORTER=ON \
   -DASSIMP_BUILD_ALL_EXPORTERS_BY_DEFAULT=OFF -DASSIMP_NO_EXPORT=ON \
   -DASSIMP_BUILD_TESTS=OFF -DASSIMP_BUILD_ASSIMP_TOOLS=OFF -DASSIMP_BUILD_SAMPLES=OFF \
-  -DASSIMP_BUILD_ZLIB=ON -DASSIMP_WARNINGS_AS_ERRORS=OFF -DASSIMP_BUILD_DRACO=OFF -DASSIMP_DOUBLE_PRECISION=OFF \
+  -DASSIMP_BUILD_ZLIB=OFF -DASSIMP_WARNINGS_AS_ERRORS=OFF -DASSIMP_BUILD_DRACO=OFF -DASSIMP_DOUBLE_PRECISION=OFF \
   -DCMAKE_INSTALL_PREFIX="$DEPS/assimp"
 cmake --build assimp-build --target install --parallel "$JOBS"
 

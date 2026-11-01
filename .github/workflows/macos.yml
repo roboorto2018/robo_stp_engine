@@ -27,7 +27,7 @@ jobs:
           path: |
             /Users/runner/deps/occt
             /Users/runner/deps/assimp
-          key: macos-occt-7.9.3-assimp-6.0.2-universal-10.15-v1
+          key: macos15-occt-7.9.3-assimp-6.0.2-syszlib-universal-10.15-v2
 
       - name: Build OpenCascade and Assimp (universal, static)
         if: steps.deps.outputs.cache-hit != 'true'

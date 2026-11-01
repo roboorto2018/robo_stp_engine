@@ -115,5 +115,7 @@ fn main() {
         for f in ["Foundation", "AppKit", "Cocoa", "OpenGL", "CoreFoundation", "IOKit"] {
             println!("cargo:rustc-link-lib=framework={f}");
         }
+        // Assimp uses the zlib of macOS (ci/macos_deps.sh): the copy it carries does not compile with Xcode 16
+        println!("cargo:rustc-link-lib=dylib=z");
     }
 }
