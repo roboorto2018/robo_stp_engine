@@ -1,0 +1,65 @@
+# The engine of robo importer for macOS, built on a Mac of GitHub (no Mac needed here): one universal program
+# robo_stp_engine (Apple Silicon + Intel), ad-hoc signed (not notarized), as an artifact of the run.
+# The Windows engine is built on Windows as before (README); this file changes nothing there.
+name: macOS engine
+
+on:
+  push:
+    branches: [mac-build]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 150
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "10.15"
+      DEPS: /Users/runner/deps
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache OpenCascade and Assimp
+        id: deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            /Users/runner/deps/occt
+            /Users/runner/deps/assimp
+          key: macos-occt-7.9.3-assimp-6.0.2-universal-10.15-v1
+
+      - name: Build OpenCascade and Assimp (universal, static)
+        if: steps.deps.outputs.cache-hit != 'true'
+        run: bash ci/macos_deps.sh
+
+      - name: Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Build the engine (arm64 and x86_64) and join them
+        run: |
+          export OCCT_ROOT="$DEPS/occt" ASSIMP_ROOT="$DEPS/assimp"
+          cargo build --release --target aarch64-apple-darwin --bin robo_stp_engine
+          cargo build --release --target x86_64-apple-darwin --bin robo_stp_engine
+          mkdir -p out
+          lipo -create -output out/robo_stp_engine \
+            target/aarch64-apple-darwin/release/robo_stp_engine target/x86_64-apple-darwin/release/robo_stp_engine
+          codesign --force --sign - out/robo_stp_engine
+          lipo -info out/robo_stp_engine
+          otool -L out/robo_stp_engine
+          vtool -show-build out/robo_stp_engine || true
+
+      - name: Self test (Apple Silicon, and Intel through Rosetta)
+        run: |
+          out/robo_stp_engine --version
+          out/robo_stp_engine --selftest
+          if arch -x86_64 /usr/bin/true 2>/dev/null; then arch -x86_64 out/robo_stp_engine --selftest; else echo "no Rosetta on this runner"; fi
+
+      - name: Tests (OpenCascade write and read back STEP / IGES)
+        run: |
+          export OCCT_ROOT="$DEPS/occt" ASSIMP_ROOT="$DEPS/assimp"
+          cargo test --release --target aarch64-apple-darwin --test engine
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: robo_stp_engine-macos-universal
+          path: out/robo_stp_engine
+          retention-days: 30

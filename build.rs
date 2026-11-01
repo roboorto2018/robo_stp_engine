@@ -42,7 +42,8 @@ fn assimp() {
         .flatten()
         .filter_map(|e| {
             let n = e.file_name().to_string_lossy().to_string();
-            let base = n.strip_suffix(".lib").or_else(|| n.strip_suffix(".a")).map(|s| s.to_string())?;
+            // libassimp.a / libzlibstatic.a on macOS: the name to link is without "lib", as for the .lib of Windows
+            let base = n.strip_suffix(".lib").or_else(|| n.strip_suffix(".a")).map(|s| s.trim_start_matches("lib").to_string())?;
             // la libreria di debug (…d.lib) non serve
             ((base.starts_with("assimp") && !base.ends_with('d')) || base.starts_with("zlibstatic")).then_some(base)
         })
@@ -107,6 +108,12 @@ fn main() {
     if cfg!(windows) {
         for s in ["user32", "gdi32", "advapi32", "ws2_32", "shell32", "ole32"] {
             println!("cargo:rustc-link-lib=dylib={s}");
+        }
+    }
+    // macOS (built on a Mac, see .github/workflows/macos.yml): the system frameworks the static OCCT toolkits refer to
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        for f in ["Foundation", "AppKit", "Cocoa", "OpenGL", "CoreFoundation", "IOKit"] {
+            println!("cargo:rustc-link-lib=framework={f}");
         }
     }
 }
